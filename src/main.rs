@@ -41,14 +41,60 @@ pub struct Forest {
 #[derive(Debug, Clone)]
 pub struct MergeNode {
     pub id: String,
-    pub parent_ids: Vec<String>,
-    pub child_ids: Vec<String>,
+    pub parents: Vec<String>,
+    pub children: Vec<String>,
+    pub author: String,
+    pub time: i64,
+    pub message: String,
 }
 
-/// Load the git repository and build the forest structure.
-pub fn load_forest(repo_path: &str) -> Result<Forest, Box<dyn Error>> {
-    let repo = Repository::open(repo_path)?;
-    let mut commit_map = HashMap::new();
+/// Represents the visible viewport into the forest.
+#[derive(Debug, Clone)]
+pub struct Viewport {
+    pub offset_x: usize,
+    pub offset_y: usize,
+    pub width: usize,
+    pub height: usize,
+    pub zoom: f64,
+}
+
+impl Viewport {
+    pub fn new(width: usize, height: usize) -> Self {
+        Viewport {
+            offset_x: 0,
+            offset_y: 0,
+            width,
+            height,
+            zoom: 1.0,
+        }
+    }
+
+    pub fn scroll(&mut self, dx: isize, dy: isize) {
+        if dx > 0 {
+            self.offset_x = self.offset_x.saturating_add(dx as usize);
+        } else {
+            self.offset_x = self.offset_x.saturating_sub((-dx) as usize);
+        }
+        if dy > 0 {
+            self.offset_y = self.offset_y.saturating_add(dy as usize);
+        } else {
+            self.offset_y = self.offset_y.saturating_sub((-dy) as usize);
+        }
+    }
+
+    pub fn zoom_in(&mut self) {
+        self.zoom = (self.zoom * 1.2).min(5.0);
+    }
+
+    pub fn zoom_out(&mut self) {
+        self.zoom = (self.zoom / 1.2).max(0.2);
+    }
+}
+
+/// Load the git repository and build the forest.
+pub fn load_forest(path: &str) -> Result<Forest, Box<dyn Error>> {
+    let repo = Repository::open(path)?;
+    let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
     revwalk.set_sorting(git2::Sort::TIME)?;
@@ -73,87 +119,83 @@ pub fn load_forest(repo_path: &str) -> Result<Forest, Box<dyn Error>> {
         );
     }
 
-    // Build trees and merges
-    let mut trees = Vec::new();
-    let mut merges = Vec::new();
-    let mut visited = HashSet::new();
-    let mut in_tree = HashSet::new();
+    // Build trees from linear commit chains
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut trees: Vec<Tree> = Vec::new();
+    let mut merges: Vec<MergeNode> = Vec::new();
+    let mut merge_ids: HashSet<String> = HashSet::new();
 
-    // Collect all commit ids sorted by time
-    let mut all_ids: Vec<String> = commit_map.keys().cloned().collect();
-    all_ids.sort_by(|a, b| {
-        let ca = &commit_map[a];
-        let cb = &commit_map[b];
-        cb.time.cmp(&ca.time)
-    });
+    // First pass: identify merge commits (more than one parent)
+    for (id, node) in &commit_map {
+        if node.parents.len() > 1 {
+            merge_ids.insert(id.clone());
+        }
+    }
 
-    for id in &all_ids {
+    // Second pass: build trees from non-merge commits
+    for (id, node) in &commit_map {
         if visited.contains(id) {
             continue;
         }
-        let commit = &commit_map[id];
-        if commit.parents.len() > 1 {
-            // This is a merge commit itself – treat as merge node
-            let child_ids = find_children(id, &commit_map, &in_tree);
-            merges.push(MergeNode {
-                id: id.clone(),
-                parent_ids: commit.parents.clone(),
-                child_ids,
-            });
-            visited.insert(id.clone());
+        if merge_ids.contains(id) {
             continue;
         }
-        // Start a new tree from this commit (it's a leaf or start of a branch)
-        let mut branch_commits = Vec::new();
+
+        // Walk backwards to find the root of this chain
+        let mut chain = Vec::new();
         let mut current = id.clone();
         loop {
             if visited.contains(&current) {
                 break;
             }
             visited.insert(current.clone());
-            in_tree.insert(current.clone());
-            branch_commits.push(current.clone());
-            let node = &commit_map[&current];
-            if node.parents.is_empty() {
+            chain.push(current.clone());
+            if let Some(node) = commit_map.get(&current) {
+                if node.parents.len() == 1 && !merge_ids.contains(&node.parents[0]) {
+                    current = node.parents[0].clone();
+                } else {
+                    break;
+                }
+            } else {
                 break;
             }
-            let parent = &node.parents[0];
-            if !commit_map.contains_key(parent) {
-                break;
-            }
-            let parent_commit = &commit_map[parent];
-            if parent_commit.parents.len() > 1 {
-                // Parent is a merge – stop here, parent will be a merge node
-                break;
-            }
-            current = parent.clone();
         }
-        if !branch_commits.is_empty() {
-            let author = commit_map[&branch_commits[0]].author.clone();
-            let color = simple_hash_color(&author);
+        if !chain.is_empty() {
+            let author = commit_map.get(&chain[0]).map(|c| c.author.clone()).unwrap_or_default();
+            let root = chain.last().cloned().unwrap_or_default();
             trees.push(Tree {
-                root: branch_commits[0].clone(),
-                commits: branch_commits,
-                color,
+                root,
+                commits: chain,
+                color: simple_hash_color(&author),
                 author,
             });
         }
     }
 
-    // Find any remaining merge nodes (commits with >1 parent not yet visited)
-    for id in &all_ids {
-        if visited.contains(id) {
-            continue;
-        }
-        let commit = &commit_map[id];
-        if commit.parents.len() > 1 {
-            let child_ids = find_children(id, &commit_map, &in_tree);
+    // Build merge nodes
+    for id in &merge_ids {
+        if let Some(node) = commit_map.get(id) {
             merges.push(MergeNode {
                 id: id.clone(),
-                parent_ids: commit.parents.clone(),
-                child_ids,
+                parents: node.parents.clone(),
+                children: Vec::new(), // will be filled later
+                author: node.author.clone(),
+                time: node.time,
+                message: node.message.clone(),
             });
-            visited.insert(id.clone());
+        }
+    }
+
+    // Fill children for merges
+    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+    for (_, node) in &commit_map {
+        for parent in &node.parents {
+            children_map.entry(parent.clone()).or_default().push(node.id.clone());
+        }
+    }
+    for merge in &mut merges {
+        if let Some(children) = children_map.get(&merge.id) {
+            merge.children = children.clone();
         }
     }
 
@@ -164,51 +206,15 @@ pub fn load_forest(repo_path: &str) -> Result<Forest, Box<dyn Error>> {
     })
 }
 
-/// Find child commits of a given commit id (commits that list this as parent).
-fn find_children(
-    id: &str,
-    commit_map: &HashMap<String, CommitNode>,
-    in_tree: &HashSet<String>,
-) -> Vec<String> {
-    let mut children = Vec::new();
-    for (_, node) in commit_map {
-        if node.parents.contains(&id.to_string()) && !in_tree.contains(&node.id) {
-            children.push(node.id.clone());
-        }
-    }
-    children
-}
-
-/// Simple hash-based color assignment for an author string.
-pub fn simple_hash_color(author: &str) -> (u8, u8, u8) {
-    let hash: u32 = author.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    let r = ((hash >> 16) & 0xFF) as u8;
+/// Simple hash-based color generation.
+fn simple_hash_color(s: &str) -> (u8, u8, u8) {
+    let hash: u64 = s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let r = (hash & 0xFF) as u8;
     let g = ((hash >> 8) & 0xFF) as u8;
-    let b = (hash & 0xFF) as u8;
-    // Ensure reasonable brightness
-    let brightness = (r as u16 + g as u16 + b as u16) / 3;
-    if brightness < 60 {
-        (r + 60, g + 60, b + 60)
-    } else {
-        (r, g, b)
-    }
+    let b = ((hash >> 16) & 0xFF) as u8;
+    // Ensure colors are bright enough
+    let r = r.max(80);
+    let g = g.max(80);
+    let b = b.max(80);
+    (r, g, b)
 }
-
-/// Render the forest as ASCII art.
-pub fn render_forest(forest: &Forest) -> String {
-    let mut output = String::new();
-    output.push_str(&format!("\x1b[1mGit Forest: {} trees, {} merges\x1b[0m\
-\
-", forest.trees.len(), forest.merges.len()));
-
-    // Assign a column for each tree
-    let mut tree_col = HashMap::new();
-    for (i, tree) in forest.trees.iter().enumerate() {
-        tree_col.insert(tree.root.clone(), i);
-    }
-
-    // Draw trees
-    for (i, tree) in forest.trees.iter().enumerate() {
-        let col = i;
-        let (r, g, b) = tree.color;
-        let color_code = format!("\x1b[38;2;{};{};{}
