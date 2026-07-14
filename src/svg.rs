@@ -1,98 +1,121 @@
-use crate::{Forest, Tree, MergeNode};
-use std::error::Error;
-use std::fs::File;
-use std::io::Write;
+use crate::{Forest, Tree, MergeNode, CommitNode, LayoutResult};
+use std::collections::HashMap;
 
-/// Export the forest as an SVG string.
-pub fn export_forest_svg(forest: &Forest, width: u32, height: u32) -> Result<String, Box<dyn Error>> {
+/// Generate an SVG representation of the forest.
+/// Returns the SVG string with proper dimensions and styling.
+pub fn render_svg(forest: &Forest, layout: &LayoutResult) -> String {
+    let width = 800.0;
+    let height = 600.0;
+    let padding = 50.0;
+    let draw_width = width - 2.0 * padding;
+    let draw_height = height - 2.0 * padding;
+
     let mut svg = String::new();
     svg.push_str(&format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}">"##,
-        width, height
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">
+  <rect width="{w}" height="{h}" fill="#f0f5f0" rx="10"/>
+  <g transform="translate({px}, {py})">
+"##,
+        w = width,
+        h = height,
+        px = padding,
+        py = padding
     ));
-    svg.push_str("<style>\n");
-    svg.push_str(".tree-trunk { fill: none; stroke-width: 3; }\n");
-    svg.push_str(".tree-branch { fill: none; stroke-width: 1.5; }\n");
-    svg.push_str(".merge-node { fill: #8B4513; stroke: #5C2E0A; stroke-width: 2; }\n");
-    svg.push_str(".leaf { fill: #228B22; opacity: 0.8; }\n");
-    svg.push_str("</style>\n");
-    svg.push_str("<rect width='100%' height='100%' fill='#1a1a2e'/>\n");
 
-    let margin = 50.0;
-    let usable_width = width as f64 - 2.0 * margin;
-    let usable_height = height as f64 - 2.0 * margin;
-
-    let tree_count = forest.trees.len();
-    if tree_count == 0 {
-        svg.push_str("</svg>");
-        return Ok(svg);
+    // Draw merge nodes (roots) first
+    for (merge_id, pos) in &layout.merge_positions {
+        let x = pos.0 * draw_width;
+        let y = (1.0 - pos.1) * draw_height; // flip y so 0 is bottom
+        svg.push_str(&format!(
+            "    <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"6\" fill=\"#8b4513\" stroke=\"#5c2d0a\" stroke-width=\"1.5\"/>\n",
+            x, y
+        ));
     }
 
-    // Layout trees horizontally
-    let spacing = usable_width / (tree_count as f64 + 1.0);
-    for (i, tree) in forest.trees.iter().enumerate() {
-        let x_center = margin + spacing * (i as f64 + 1.0);
-        let trunk_top_y = margin;
-        let trunk_bottom_y = margin + usable_height * 0.7;
-        // Draw trunk
-        let trunk_color = format!("#{:02x}{:02x}{:02x}", tree.color.0, tree.color.1, tree.color.2);
-        svg.push_str(&format!(
-            r##"<line x1="{}" y1="{}" x2="{}" y2="{}" class="tree-trunk" stroke="{}"/>"##,
-            x_center, trunk_top_y, x_center, trunk_bottom_y, trunk_color
-        ));
-        // Draw branches (commits)
-        let commit_count = tree.commits.len();
-        if commit_count > 1 {
-            let step = (trunk_bottom_y - trunk_top_y) / (commit_count as f64 - 1.0);
-            for (j, _commit_id) in tree.commits.iter().enumerate() {
-                let y = trunk_top_y + step * j as f64;
-                // branch offset
-                let offset = (j as f64 * 0.3).sin() * 15.0;
-                svg.push_str(&format!(
-                    r##"<line x1="{}" y1="{}" x2="{}" y2="{}" class="tree-branch" stroke="{}"/>"##,
-                    x_center, y, x_center + offset, y - 5.0, trunk_color
-                ));
-                // leaf at end of branch
-                svg.push_str(&format!(
-                    r##"<circle cx="{}" cy="{}" r="3" class="leaf"/>"##,
-                    x_center + offset, y - 5.0
-                ));
+    // Draw trees
+    for tree in &forest.trees {
+        let commits = &tree.commits;
+        if commits.is_empty() {
+            continue;
+        }
+        let color_str = format!("#{:02x}{:02x}{:02x}", tree.color.0, tree.color.1, tree.color.2);
+        // Get positions for this tree's commits
+        let mut points: Vec<(f64, f64)> = Vec::new();
+        for cid in commits {
+            if let Some(pos) = layout.positions.get(cid) {
+                let x = pos.0 * draw_width;
+                let y = (1.0 - pos.1) * draw_height;
+                points.push((x, y));
+            }
+        }
+        if points.is_empty() {
+            continue;
+        }
+        // Sort by y (descending, so root at top? Actually we want trunk from bottom to top)
+        // We'll draw from bottom (largest y) to top (smallest y)
+        points.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Draw trunk as a thick line
+        if points.len() >= 2 {
+            let trunk_points: Vec<String> = points
+                .iter()
+                .map(|(x, y)| format!("{:.1},{:.1}", x, y))
+                .collect::<Vec<_>>()
+                .join(" ");
+            svg.push_str(&format!(
+                "    <polyline points=\"{}\" stroke=\"{}\" stroke-width=\"4\" fill=\"none\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n",
+                trunk_points, color_str
+            ));
+        }
+
+        // Draw leaves (commits) as circles with varying radius based on commit frequency
+        // We'll use commit count on this branch as leaf density proxy
+        let leaf_radius = 3.0 + (commits.len() as f64 * 0.5).min(8.0);
+        for (x, y) in &points {
+            svg.push_str(&format!(
+                "    <circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" fill=\"{}\" stroke=\"#333\" stroke-width=\"1\" opacity=\"0.9\"/>\n",
+                x, y, leaf_radius, color_str
+            ));
+        }
+    }
+
+    // Draw merge connections as curved lines (root systems)
+    // For each merge node, connect to its parent commits
+    for (merge_id, pos) in &layout.merge_positions {
+        let mx = pos.0 * draw_width;
+        let my = (1.0 - pos.1) * draw_height;
+        if let Some(merge_node) = forest.merge_map.get(merge_id) {
+            for parent_id in &merge_node.parents {
+                if let Some(parent_pos) = layout.positions.get(parent_id) {
+                    let px = parent_pos.0 * draw_width;
+                    let py = (1.0 - parent_pos.1) * draw_height;
+                    // Draw a bezier curve connecting merge node to parent
+                    let ctrl_x = (mx + px) / 2.0;
+                    let ctrl_y = (my + py) / 2.0 - 30.0; // pull up to create arch
+                    svg.push_str(&format!(
+                        "    <path d=\"M {:.1} {:.1} Q {:.1} {:.1} {:.1} {:.1}\" stroke=\"#8b4513\" stroke-width=\"2\" fill=\"none\" stroke-dasharray=\"4,2\" opacity=\"0.7\"/>\n",
+                        mx, my, ctrl_x, ctrl_y, px, py
+                    ));
+                }
             }
         }
     }
 
-    // Draw merge nodes
-    for merge in &forest.merges {
-        // Place merge nodes in lower area
-        let merge_y = margin + usable_height * 0.85;
-        let merge_x = margin + usable_width * (merge.id.len() as f64 % 10.0) / 10.0; // simplistic placement
-        svg.push_str(&format!(
-            r##"<circle cx="{}" cy="{}" r="8" class="merge-node"/>"##,
-            merge_x, merge_y
-        ));
-        // Draw lines from parent trees to merge
-        for parent_id in &merge.parents {
-            // Find parent tree x position
-            if let Some(parent_tree) = forest.trees.iter().find(|t| t.root == *parent_id || t.commits.contains(parent_id)) {
-                let parent_idx = forest.trees.iter().position(|t| t.root == parent_tree.root).unwrap();
-                let parent_x = margin + spacing * (parent_idx as f64 + 1.0);
-                let parent_y = margin + usable_height * 0.7;
-                svg.push_str(&format!(
-                    r##"<line x1="{}" y1="{}" x2="{}" y2="{}" class="tree-branch" stroke="#8B4513"/>"##,
-                    parent_x, parent_y, merge_x, merge_y
-                ));
-            }
-        }
-    }
-
+    svg.push_str("  </g>\n");
+    svg.push_str(&format!(
+        "  <text x=\"{}\" y=\"{}\" font-family=\"monospace\" font-size=\"12\" fill=\"#666\" text-anchor=\"middle\">Git Forest - {} trees, {} merges</text>\n",
+        width / 2.0,
+        height - 10.0,
+        forest.trees.len(),
+        forest.merge_map.len()
+    ));
     svg.push_str("</svg>");
-    Ok(svg)
+    svg
 }
 
-/// Write the SVG to a file.
-pub fn export_forest_to_file(forest: &Forest, path: &str) -> Result<(), Box<dyn Error>> {
-    let svg_content = export_forest_svg(forest, 800, 600)?;
-    let mut file = File::create(path)?;
-    file.write_all(svg_content.as_bytes())?;
+/// Write SVG to a file path.
+pub fn export_svg(forest: &Forest, layout: &LayoutResult, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let svg = render_svg(forest, layout);
+    std::fs::write(path, svg.as_bytes())?;
     Ok(())
 }
