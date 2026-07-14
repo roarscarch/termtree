@@ -1,3 +1,4 @@
+use clap::{App, Arg};
 use git2::Repository;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -9,6 +10,12 @@ use termion::raw::IntoRawMode;
 use termion::cursor;
 use termion::clear;
 use termion::color;
+
+mod animate;
+mod interact;
+mod layout;
+mod merge_storm;
+mod svg;
 
 /// A single commit in our forest representation.
 #[derive(Debug, Clone)]
@@ -43,61 +50,99 @@ pub struct MergeNode {
     pub id: String,
     pub parents: Vec<String>,
     pub children: Vec<String>,
-    pub author: String,
     pub time: i64,
+    pub author: String,
     pub message: String,
 }
 
-/// Represents the visible viewport into the forest.
-#[derive(Debug, Clone)]
-pub struct Viewport {
-    pub offset_x: usize,
-    pub offset_y: usize,
-    pub width: usize,
-    pub height: usize,
-    pub zoom: f64,
+/// Supported output modes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OutputMode {
+    Interactive,
+    Animated,
+    Svg,
+    Static,
 }
 
-impl Viewport {
-    pub fn new(width: usize, height: usize) -> Self {
-        Viewport {
-            offset_x: 0,
-            offset_y: 0,
-            width,
-            height,
-            zoom: 1.0,
+fn main() -> Result<(), Box<dyn Error>> {
+    let matches = App::new("git-forest")
+        .version("0.1.0")
+        .author("Git Forest Team")
+        .about("See your git history grow as an ASCII-art forest")
+        .arg(
+            Arg::with_name("path")
+                .help("Path to the git repository (default: current directory)")
+                .default_value(".")
+                .index(1),
+        )
+        .arg(
+            Arg::with_name("mode")
+                .short("m")
+                .long("mode")
+                .help("Output mode: interactive, animated, svg, static")
+                .possible_values(&["interactive", "animated", "svg", "static"])
+                .default_value("interactive"),
+        )
+        .arg(
+            Arg::with_name("output")
+                .short("o")
+                .long("output")
+                .help("Output file for SVG export (only used in svg mode)")
+                .default_value("forest.svg"),
+        )
+        .get_matches();
+
+    let repo_path = matches.value_of("path").unwrap();
+    let mode_str = matches.value_of("mode").unwrap();
+    let output_path = matches.value_of("output").unwrap();
+
+    let mode = match mode_str {
+        "interactive" => OutputMode::Interactive,
+        "animated" => OutputMode::Animated,
+        "svg" => OutputMode::Svg,
+        "static" => OutputMode::Static,
+        _ => unreachable!(),
+    };
+
+    eprintln!("Opening repository at: {}", repo_path);
+    let repo = Repository::open(repo_path)?;
+
+    let forest = build_forest(&repo)?;
+    eprintln!("Built forest with {} trees and {} merges", forest.trees.len(), forest.merges.len());
+
+    match mode {
+        OutputMode::Interactive => {
+            eprintln!("Entering interactive mode. Use arrow keys to scroll, +/- to zoom, q to quit.");
+            interact::run_interactive(&forest)?;
+        }
+        OutputMode::Animated => {
+            eprintln!("Starting animated forest (press Ctrl+C to stop)...");
+            animate::run_animation(&forest)?;
+        }
+        OutputMode::Svg => {
+            eprintln!("Exporting forest to SVG: {}", output_path);
+            let svg_content = svg::render_forest_svg(&forest)?;
+            std::fs::write(output_path, svg_content)?;
+            eprintln!("SVG saved to {}", output_path);
+        }
+        OutputMode::Static => {
+            eprintln!("Rendering static ASCII forest...");
+            let ascii = render_static(&forest);
+            println!("{}", ascii);
         }
     }
 
-    pub fn scroll(&mut self, dx: isize, dy: isize) {
-        if dx > 0 {
-            self.offset_x = self.offset_x.saturating_add(dx as usize);
-        } else {
-            self.offset_x = self.offset_x.saturating_sub((-dx) as usize);
-        }
-        if dy > 0 {
-            self.offset_y = self.offset_y.saturating_add(dy as usize);
-        } else {
-            self.offset_y = self.offset_y.saturating_sub((-dy) as usize);
-        }
-    }
-
-    pub fn zoom_in(&mut self) {
-        self.zoom = (self.zoom * 1.2).min(5.0);
-    }
-
-    pub fn zoom_out(&mut self) {
-        self.zoom = (self.zoom / 1.2).max(0.2);
-    }
+    Ok(())
 }
 
-/// Load the git repository and build the forest.
-pub fn load_forest(path: &str) -> Result<Forest, Box<dyn Error>> {
-    let repo = Repository::open(path)?;
-    let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
+/// Build a Forest from a git2 Repository.
+pub fn build_forest(repo: &Repository) -> Result<Forest, Box<dyn Error>> {
     let mut revwalk = repo.revwalk()?;
     revwalk.push_head()?;
     revwalk.set_sorting(git2::Sort::TIME)?;
+
+    let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
+    let mut parent_counts: HashMap<String, usize> = HashMap::new();
 
     for oid_result in revwalk {
         let oid = oid_result?;
@@ -107,114 +152,61 @@ pub fn load_forest(path: &str) -> Result<Forest, Box<dyn Error>> {
         let time = commit.time().seconds();
         let message = commit.message().unwrap_or("").to_string();
         let parents: Vec<String> = commit.parents().map(|p| p.id().to_string()).collect();
-        commit_map.insert(
-            id.clone(),
-            CommitNode {
-                id,
-                author,
-                time,
-                message,
-                parents,
-            },
-        );
+
+        commit_map.insert(id.clone(), CommitNode {
+            id: id.clone(),
+            author,
+            time,
+            message,
+            parents: parents.clone(),
+        });
+
+        *parent_counts.entry(id).or_insert(0) += 0;
+        for p in &parents {
+            *parent_counts.entry(p.clone()).or_insert(0) += 1;
+        }
     }
 
-    // Build trees from linear commit chains
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut trees: Vec<Tree> = Vec::new();
+    // Identify merge commits (more than one parent)
     let mut merges: Vec<MergeNode> = Vec::new();
-    let mut merge_ids: HashSet<String> = HashSet::new();
-
-    // First pass: identify merge commits (more than one parent)
     for (id, node) in &commit_map {
         if node.parents.len() > 1 {
-            merge_ids.insert(id.clone());
-        }
-    }
-
-    // Second pass: build trees from non-merge commits
-    for (id, node) in &commit_map {
-        if visited.contains(id) {
-            continue;
-        }
-        if merge_ids.contains(id) {
-            continue;
-        }
-
-        // Walk backwards to find the root of this chain
-        let mut chain = Vec::new();
-        let mut current = id.clone();
-        loop {
-            if visited.contains(&current) {
-                break;
-            }
-            visited.insert(current.clone());
-            chain.push(current.clone());
-            if let Some(node) = commit_map.get(&current) {
-                if node.parents.len() == 1 && !merge_ids.contains(&node.parents[0]) {
-                    current = node.parents[0].clone();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        if !chain.is_empty() {
-            let author = commit_map.get(&chain[0]).map(|c| c.author.clone()).unwrap_or_default();
-            let root = chain.last().cloned().unwrap_or_default();
-            trees.push(Tree {
-                root,
-                commits: chain,
-                color: simple_hash_color(&author),
-                author,
-            });
-        }
-    }
-
-    // Build merge nodes
-    for id in &merge_ids {
-        if let Some(node) = commit_map.get(id) {
+            let children: Vec<String> = commit_map.values()
+                .filter(|c| c.parents.contains(id))
+                .map(|c| c.id.clone())
+                .collect();
             merges.push(MergeNode {
                 id: id.clone(),
                 parents: node.parents.clone(),
-                children: Vec::new(), // will be filled later
-                author: node.author.clone(),
+                children,
                 time: node.time,
+                author: node.author.clone(),
                 message: node.message.clone(),
             });
         }
     }
 
-    // Fill children for merges
-    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
-    for (_, node) in &commit_map {
-        for parent in &node.parents {
-            children_map.entry(parent.clone()).or_default().push(node.id.clone());
-        }
-    }
-    for merge in &mut merges {
-        if let Some(children) = children_map.get(&merge.id) {
-            merge.children = children.clone();
-        }
-    }
+    // Build trees by following linear chains (no merges)
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut trees: Vec<Tree> = Vec::new();
 
-    Ok(Forest {
-        trees,
-        merges,
-        commit_map,
-    })
-}
+    // Start from root commits (no children or all children visited)
+    let root_candidates: Vec<String> = commit_map.keys()
+        .filter(|id| {
+            // A root is a commit that has no children (leaf) or is the initial commit
+            let has_children = commit_map.values().any(|c| c.parents.contains(id));
+            !has_children || parent_counts.get(*id).copied().unwrap_or(0) == 0
+        })
+        .cloned()
+        .collect();
 
-/// Simple hash-based color generation.
-fn simple_hash_color(s: &str) -> (u8, u8, u8) {
-    let hash: u64 = s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    let r = (hash & 0xFF) as u8;
-    let g = ((hash >> 8) & 0xFF) as u8;
-    let b = ((hash >> 16) & 0xFF) as u8;
-    // Ensure colors are bright enough
-    let r = r.max(80);
-    let g = g.max(80);
-    let b = b.max(80);
-    (r, g, b)
-}
+    for root in &root_candidates {
+        if visited.contains(root) {
+            continue;
+        }
+        let mut commits: Vec<String> = Vec::new();
+        let mut current = root.clone();
+        loop {
+            if visited.contains(&current) {
+                break;
+            }
