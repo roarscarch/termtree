@@ -1,6 +1,20 @@
 [package]
 name = "git-forest"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "See your git history grow — a CLI tool that renders your git commit graph as an interactive ASCII-art forest"
+license = "MIT"
+repository = "https://github.com/yourusername/git-forest"
+keywords = ["git", "ascii", "forest", "visualization", "cli"]
+categories = ["command-line-utilities", "visualization"]
 
 [dependencies]
+git2 = "0.18"
+termion = "2.0"
+clap = { version = "4.4", features = ["derive"] }
+chrono = "0.4"
+rand = "0.8"
+
+[[bin]]
+name = "git-forest"
+path = "src/main.rs"
