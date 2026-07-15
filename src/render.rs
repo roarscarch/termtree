@@ -1,156 +1,89 @@
-use crate::{Forest, Tree, CommitNode, MergeNode, LayoutResult};
+use crate::{Forest, Tree, MergeNode, LayoutResult};
 use termion::color;
-use std::collections::HashMap;
+use std::io::{self, Write, stdout};
 
-/// Render the forest as ASCII art for the terminal.
-pub fn render_forest(forest: &Forest, layout: &LayoutResult, width: u16, height: u16, offset_x: f64, offset_y: f64, zoom: f64) -> String {
+/// Render the forest to a terminal string using ASCII art.
+/// Trunks are drawn as vertical lines, branches as slashes, leaves as dots.
+/// Merge nodes are drawn as asterisks.
+pub fn render_forest_to_terminal(
+    forest: &Forest,
+    layout: &LayoutResult,
+    width: u16,
+    height: u16,
+) -> String {
     let mut output = String::new();
-    let tree_count = forest.trees.len();
-    if tree_count == 0 {
-        return output;
-    }
-
-    // Prepare a grid of characters
-    let grid_rows = height as usize;
-    let grid_cols = width as usize;
-    let mut grid: Vec<Vec<char>> = vec![vec![' '; grid_cols]; grid_rows];
+    let w = width as usize;
+    let h = height as usize;
+    let mut grid: Vec<Vec<char>> = vec![vec![' '; w]; h];
+    let mut colors: Vec<Vec<Option<(u8, u8, u8)>>> = vec![vec![None; w]; h];
 
     // Draw trees
     for tree in &forest.trees {
-        let tree_index = forest.trees.iter().position(|t| t.root == tree.root).unwrap_or(0);
-        let center_x = if tree_index < layout.tree_centers.len() {
-            layout.tree_centers[tree_index]
-        } else {
-            0.5
-        };
-        // Convert normalized x to screen x
-        let screen_x = ((center_x * width as f64) as i32 + offset_x as i32) as usize;
-        if screen_x >= grid_cols {
+        if tree.commits.is_empty() {
             continue;
         }
-
-        // Draw trunk from bottom to top
-        let trunk_length = tree.commits.len().min(grid_rows);
-        for i in 0..trunk_length {
-            let row = grid_rows - 1 - i;
-            if row < grid_rows && screen_x < grid_cols {
-                grid[row][screen_x] = '|';
+        let center_x = layout
+            .tree_centers
+            .get(forest.trees.iter().position(|t| t.root == tree.root).unwrap_or(0))
+            .copied()
+            .unwrap_or(0.5);
+        let x = (center_x * (w as f64 - 1.0)) as usize;
+        // Draw trunk from bottom up
+        let trunk_start = (h as f64 * 0.1) as usize;
+        let trunk_end = (h as f64 * 0.8) as usize;
+        for y in trunk_start..=trunk_end {
+            if y < h && x < w {
+                grid[y][x] = '|';
+                colors[y][x] = Some(tree.color);
             }
         }
-
-        // Draw leaves (commits) along the trunk
-        for (i, commit_id) in tree.commits.iter().enumerate() {
-            let row = grid_rows - 1 - i;
-            if row < grid_rows && screen_x < grid_cols {
-                // Leaf density: if multiple commits near same row, cluster leaves
-                let leaf_char = if i % 3 == 0 { '*' } else { '.' };
-                grid[row][screen_x] = leaf_char;
+        // Draw leaves at top
+        let leaf_y = trunk_start.saturating_sub(1);
+        if leaf_y < h && x < w {
+            grid[leaf_y][x] = '@';
+            colors[leaf_y][x] = Some(tree.color);
+        }
+        // Draw leaves proportional to commit frequency
+        let leaf_density = (tree.commits.len() as f64 / forest.trees.len().max(1) as f64).min(1.0);
+        let leaf_count = (leaf_density * 5.0) as usize + 1;
+        for i in 0..leaf_count {
+            let leaf_x = x as isize + (i as isize - leaf_count as isize / 2);
+            let leaf_y = trunk_end + 1 + i % 2;
+            if leaf_x >= 0 && leaf_x < w as isize && leaf_y < h {
+                grid[leaf_y][leaf_x as usize] = '.';
+                colors[leaf_y][leaf_x as usize] = Some(tree.color);
             }
         }
     }
 
     // Draw merge nodes
-    for (merge_id, merge_node) in &forest.merge_map {
-        if let Some(&(mx, my)) = layout.merge_positions.get(merge_id) {
-            let screen_x = ((mx * width as f64) as i32 + offset_x as i32) as usize;
-            let screen_y = ((my * height as f64) as i32 + offset_y as i32) as usize;
-            if screen_x < grid_cols && screen_y < grid_rows {
-                // Merge node symbol: '#' for root systems
-                grid[screen_y][screen_x] = '#';
+    for merge in &forest.merges {
+        if let Some(&(mx, my)) = layout.merge_positions.get(&merge.id) {
+            let x = (mx * (w as f64 - 1.0)) as usize;
+            let y = (my * (h as f64 - 1.0)) as usize;
+            if y < h && x < w {
+                grid[y][x] = '*';
+                colors[y][x] = Some((255, 215, 0)); // gold for merge nodes
             }
         }
     }
 
-    // Convert grid to string
-    for row in &grid {
-        let line: String = row.iter().collect();
-        output.push_str(&line);
-        output.push('\n');
-    }
-
-    output
-}
-
-/// Render a colored version of the forest (each tree gets author color).
-pub fn render_colored_forest(forest: &Forest, layout: &LayoutResult, width: u16, height: u16, offset_x: f64, offset_y: f64, zoom: f64) -> String {
-    let mut output = String::new();
-    let tree_count = forest.trees.len();
-    if tree_count == 0 {
-        return output;
-    }
-
-    let grid_rows = height as usize;
-    let grid_cols = width as usize;
-    // Each cell stores (char, color_tuple)
-    let mut grid: Vec<Vec<(char, Option<(u8,u8,u8)>)>> = vec![vec![(' ', None); grid_cols]; grid_rows];
-
-    for tree in &forest.trees {
-        let tree_index = forest.trees.iter().position(|t| t.root == tree.root).unwrap_or(0);
-        let center_x = if tree_index < layout.tree_centers.len() {
-            layout.tree_centers[tree_index]
-        } else {
-            0.5
-        };
-        let screen_x = ((center_x * width as f64) as i32 + offset_x as i32) as usize;
-        if screen_x >= grid_cols {
-            continue;
-        }
-
-        let color_tuple = tree.color;
-
-        let trunk_length = tree.commits.len().min(grid_rows);
-        for i in 0..trunk_length {
-            let row = grid_rows - 1 - i;
-            if row < grid_rows && screen_x < grid_cols {
-                grid[row][screen_x] = ('|', Some(color_tuple));
+    // Build output string with ANSI colors
+    for y in 0..h {
+        for x in 0..w {
+            let ch = grid[y][x];
+            if let Some((r, g, b)) = colors[y][x] {
+                let color_str = format!("\x1b[38;2;{};{};{}m", r, g, b);
+                output.push_str(&color_str);
+                output.push(ch);
+                output.push_str("\x1b[0m");
+            } else {
+                output.push(ch);
             }
         }
-
-        for (i, commit_id) in tree.commits.iter().enumerate() {
-            let row = grid_rows - 1 - i;
-            if row < grid_rows && screen_x < grid_cols {
-                let leaf_char = if i % 3 == 0 { '*' } else { '.' };
-                grid[row][screen_x] = (leaf_char, Some(color_tuple));
-            }
+        if y < h - 1 {
+            output.push('\n');
         }
     }
-
-    // Draw merge nodes with a default color (white/gray)
-    for (merge_id, merge_node) in &forest.merge_map {
-        if let Some(&(mx, my)) = layout.merge_positions.get(merge_id) {
-            let screen_x = ((mx * width as f64) as i32 + offset_x as i32) as usize;
-            let screen_y = ((my * height as f64) as i32 + offset_y as i32) as usize;
-            if screen_x < grid_cols && screen_y < grid_rows {
-                grid[screen_y][screen_x] = ('#', Some((128, 128, 128)));
-            }
-        }
-    }
-
-    // Build output with ANSI color codes
-    for row in &grid {
-        let mut line = String::new();
-        let mut current_color: Option<(u8,u8,u8)> = None;
-        for (ch, color_opt) in row {
-            if let Some(c) = color_opt {
-                if current_color != Some(*c) {
-                    // Set color
-                    let (r, g, b) = c;
-                    line.push_str(&format!("\x1b[38;2;{};{};{}m", r, g, b));
-                    current_color = Some(*c);
-                }
-            } else if current_color.is_some() {
-                // Reset color
-                line.push_str("\x1b[0m");
-                current_color = None;
-            }
-            line.push(*ch);
-        }
-        if current_color.is_some() {
-            line.push_str("\x1b[0m");
-        }
-        output.push_str(&line);
-        output.push('\n');
-    }
-
     output
 }
