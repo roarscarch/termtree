@@ -10,6 +10,8 @@ pub struct LayoutResult {
     pub merge_positions: HashMap<String, (f64, f64)>,
     /// For each tree, its horizontal center (x coordinate)
     pub tree_centers: Vec<f64>,
+    /// Depth (branch level) for each commit: 0 = main trunk, higher = side branches
+    pub branch_levels: HashMap<String, usize>,
 }
 
 /// Layout the forest on a 2D grid with gravitational pull between related commits.
@@ -21,6 +23,7 @@ pub fn layout_forest(forest: &Forest, width: f64, height: f64) -> LayoutResult {
             positions: HashMap::new(),
             merge_positions: HashMap::new(),
             tree_centers: vec![],
+            branch_levels: HashMap::new(),
         };
     }
 
@@ -38,99 +41,125 @@ pub fn layout_forest(forest: &Forest, width: f64, height: f64) -> LayoutResult {
 
     let mut positions: HashMap<String, (f64, f64)> = HashMap::new();
     let mut merge_positions: HashMap<String, (f64, f64)> = HashMap::new();
+    let mut branch_levels: HashMap<String, usize> = HashMap::new();
 
-    // 2. Position commits within each tree vertically, with gravitational pull toward related trees
-    // We'll process trees in order of depth (longest branch first) for stability
-    let mut tree_order: Vec<usize> = (0..tree_count).collect();
-    tree_order.sort_by_key(|&i| std::cmp::Reverse(forest.trees[i].commits.len()));
-
-    // Track vertical progress for each tree (y coordinate from 0 top to 1 bottom)
-    let mut tree_y_progress: Vec<f64> = vec![0.0; tree_count];
-    // Track maximum y used in each tree (for spacing)
-    let mut tree_max_y: Vec<f64> = vec![0.0; tree_count];
-
-    // First pass: place commits in each tree linearly
-    for &idx in &tree_order {
-        let tree = &forest.trees[idx];
-        let x = tree_centers[idx];
-        let commit_count = tree.commits.len();
-        if commit_count == 0 { continue; }
-        // Reserve space: each commit gets a vertical slice, with small padding
-        let vertical_step = 0.8 / (commit_count as f64 + 1.0);
-        let mut y = 0.1 + vertical_step; // start a bit from top
-        for commit_id in &tree.commits {
-            positions.insert(commit_id.clone(), (x, y));
-            y += vertical_step;
+    // 2. Compute topological order (BFS from roots)
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, _) in &forest.commit_map {
+        in_degree.entry(id.clone()).or_insert(0);
+        children.entry(id.clone()).or_insert_with(Vec::new);
+    }
+    for (id, node) in &forest.commit_map {
+        for parent in &node.parents {
+            children.entry(parent.clone()).or_insert_with(Vec::new).push(id.clone());
+            *in_degree.entry(id.clone()).or_insert(0) += 1;
         }
-        tree_max_y[idx] = y;
     }
 
-    // 3. Apply gravitational pull: for each merge, pull parent commits toward the merge point
-    // We'll run several iterations to stabilize
-    for _iteration in 0..5 {
-        for merge in &forest.merges {
-            let merge_x = tree_centers.iter().sum::<f64>() / tree_centers.len() as f64; // center
-            let merge_y = 0.5; // middle
-            // Find the merge's position (approximate)
-            let merge_pos = (merge_x, merge_y);
-            merge_positions.insert(merge.id.clone(), merge_pos);
-
-            // Pull parents toward this merge point
-            for parent_id in &merge.parents {
-                if let Some(pos) = positions.get_mut(parent_id) {
-                    // Gravitational pull: shift x toward merge_x
-                    let dx = merge_x - pos.0;
-                    pos.0 += dx * 0.1;
-                    // Also slightly adjust y to align horizontally
-                    let dy = merge_y - pos.1;
-                    pos.1 += dy * 0.05;
-                }
-            }
-        }
-
-        // Also pull within same tree: commits should form a smooth curve
-        for tree in &forest.trees {
-            let x_target = tree_centers.iter().position(|&c| c == tree_centers[0]).unwrap_or(0);
-            let x_center = tree_centers[x_target];
-            for window in tree.commits.windows(2) {
-                let id1 = &window[0];
-                let id2 = &window[1];
-                if let (Some(&(x1, y1)), Some(&(x2, y2))) = (positions.get(id1), positions.get(id2)) {
-                    // Attract consecutive commits to maintain trunk line
-                    let mid_x = (x1 + x2) / 2.0;
-                    let mid_y = (y1 + y2) / 2.0;
-                    if let Some(pos1) = positions.get_mut(id1) {
-                        pos1.0 += (mid_x - pos1.0) * 0.05;
-                        pos1.1 += (mid_y - pos1.1) * 0.05;
-                    }
-                    if let Some(pos2) = positions.get_mut(id2) {
-                        pos2.0 += (mid_x - pos2.0) * 0.05;
-                        pos2.1 += (mid_y - pos2.1) * 0.05;
+    // 3. Assign branch levels via DFS from root, tracking depth along each path
+    // We process trees in order, assigning level 0 to the trunk (longest path from root)
+    for tree in &forest.trees {
+        let root_id = &tree.root;
+        // First, find all commits in this tree
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(root_id.clone());
+        visited.insert(root_id.clone());
+        while let Some(id) = queue.pop_front() {
+            if let Some(node) = forest.commit_map.get(&id) {
+                for child in children.get(&id).unwrap_or(&vec![]) {
+                    if visited.insert(child.clone()) {
+                        queue.push_back(child.clone());
                     }
                 }
             }
         }
+
+        // Now assign levels: root = 0, each child = parent's level + 1, but merges get min of parents
+        let mut topo: Vec<String> = Vec::new();
+        let mut in_deg_local: HashMap<String, usize> = HashMap::new();
+        for id in &visited {
+            in_deg_local.insert(id.clone(), 0);
+        }
+        for id in &visited {
+            if let Some(node) = forest.commit_map.get(id) {
+                for parent in &node.parents {
+                    if visited.contains(parent) {
+                        *in_deg_local.entry(id.clone()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut q: VecDeque<String> = VecDeque::new();
+        for (id, deg) in &in_deg_local {
+            if *deg == 0 {
+                q.push_back(id.clone());
+            }
+        }
+        while let Some(id) = q.pop_front() {
+            topo.push(id.clone());
+            if let Some(node) = forest.commit_map.get(&id) {
+                for child in children.get(&id).unwrap_or(&vec![]) {
+                    if visited.contains(child) {
+                        if let Some(deg) = in_deg_local.get_mut(child) {
+                            *deg -= 1;
+                            if *deg == 0 {
+                                q.push_back(child.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assign levels: for each commit, level = max(parent levels) + 1, but for merges take min of parents
+        for id in &topo {
+            if id == root_id {
+                branch_levels.insert(id.clone(), 0);
+            } else if let Some(node) = forest.commit_map.get(id) {
+                let parent_levels: Vec<usize> = node.parents.iter()
+                    .filter(|p| visited.contains(*p))
+                    .filter_map(|p| branch_levels.get(p))
+                    .cloned()
+                    .collect();
+                if parent_levels.is_empty() {
+                    branch_levels.insert(id.clone(), 0);
+                } else if node.parents.len() > 1 {
+                    // Merge: take minimum parent level (closer to trunk)
+                    let min_level = parent_levels.iter().min().cloned().unwrap_or(0);
+                    branch_levels.insert(id.clone(), min_level);
+                } else {
+                    let max_level = parent_levels.iter().max().cloned().unwrap_or(0);
+                    branch_levels.insert(id.clone(), max_level + 1);
+                }
+            }
+        }
     }
 
-    // 4. Normalize positions to [0,1] range and ensure no overlap
-    let mut all_x: Vec<f64> = positions.values().map(|&(x, _)| x).collect();
-    let mut all_y: Vec<f64> = positions.values().map(|&(_, y)| y).collect();
-    for &(x, y) in merge_positions.values() {
-        all_x.push(x);
-        all_y.push(y);
-    }
-    let min_x = all_x.iter().cloned().fold(f64::MAX, f64::min);
-    let max_x = all_x.iter().cloned().fold(f64::MIN, f64::max);
-    let min_y = all_y.iter().cloned().fold(f64::MAX, f64::min);
-    let max_y = all_y.iter().cloned().fold(f64::MIN, f64::max);
-    let range_x = if (max_x - min_x).abs() < 0.001 { 1.0 } else { max_x - min_x };
-    let range_y = if (max_y - min_y).abs() < 0.001 { 1.0 } else { max_y - min_y };
+    // 4. Place commits vertically by topological order, horizontally by tree center + branch offset
+    // Use a simple layered approach: assign each commit a 'layer' (depth from root via longest path)
+    let mut commit_order: Vec<&String> = forest.commit_map.keys().collect();
+    // Sort by time ascending (root earliest)
+    commit_order.sort_by(|a, b| {
+        let ca = forest.commit_map.get(a).map(|c| c.time).unwrap_or(0);
+        let cb = forest.commit_map.get(b).map(|c| c.time).unwrap_or(0);
+        ca.cmp(&cb)
+    });
 
-    for (_, pos) in positions.iter_mut() {
-        pos.0 = (pos.0 - min_x) / range_x;
-        pos.1 = (pos.1 - min_y) / range_y;
-    }
-    for (_, pos) in merge_positions.iter_mut() {
-        pos.0 = (pos.0 - min_x) / range_x;
-        pos.1 = (pos.1 - min_y) / range_y;
+    // Group commits by their tree assignment
+    let mut commit_to_tree: HashMap<String, usize> = HashMap::new();
+    for (i, tree) in forest.trees.iter().enumerate() {
+        let mut stack: Vec<String> = vec![tree.root.clone()];
+        let mut visited: HashSet<String> = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if visited.insert(id.clone()) {
+                commit_to_tree.insert(id.clone(), i);
+                if let Some(node) = forest.commit_map.get(&id) {
+                    for child in &node.children {
+                        stack.push(child.clone());
+                    }
+                }
+            }
+        }
     }
