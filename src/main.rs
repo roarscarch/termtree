@@ -1,9 +1,5 @@
-use clap::{App, Arg};
-use git2::Repository;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::env;
-use std::error::Error;
-use std::io::{self, Write, stdin, stdout};
+use std::io::{self, Write, stdout, stdin};
+use std::time::{Duration, Instant};
 use termion::event::Key;
 use termion::input::TermRead;
 use termion::raw::IntoRawMode;
@@ -11,202 +7,177 @@ use termion::cursor;
 use termion::clear;
 use termion::color;
 
-mod animate;
-mod interact;
+mod types;
+mod scan;
+mod color;
 mod layout;
+mod render;
+mod interact;
+mod animate;
 mod merge_storm;
 mod svg;
 
-/// A single commit in our forest representation.
-#[derive(Debug, Clone)]
-pub struct CommitNode {
-    pub id: String,
-    pub author: String,
-    pub time: i64,
-    pub message: String,
-    pub parents: Vec<String>,
-}
+use types::{Forest, Tree, CommitNode, MergeNode};
+use scan::scan_repository;
+use color::assign_author_colors;
+use layout::layout_forest;
+use render::render_forest;
+use interact::{InteractiveView, find_commit_at_position};
+use animate::{AnimationState, render_animated_frame};
+use merge_storm::detect_merge_storms;
+use svg::export_svg;
 
-/// A tree represents a linear branch (a chain of commits with no merges).
-#[derive(Debug, Clone)]
-pub struct Tree {
-    pub root: String,
-    pub commits: Vec<String>,
-    pub color: (u8, u8, u8),
-    pub author: String,
-}
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let repo_path = if args.len() > 1 { &args[1] } else { "." };
 
-/// The entire forest – a collection of trees and merge points.
-#[derive(Debug)]
-pub struct Forest {
-    pub trees: Vec<Tree>,
-    pub merges: Vec<MergeNode>,
-    pub commit_map: HashMap<String, CommitNode>,
-}
+    println!("Scanning repository: {}", repo_path);
+    let forest = scan_repository(repo_path).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("Failed to scan repo: {}", e))
+    })?;
 
-/// A merge node – where multiple trees join.
-#[derive(Debug, Clone)]
-pub struct MergeNode {
-    pub id: String,
-    pub parents: Vec<String>,
-    pub children: Vec<String>,
-    pub time: i64,
-    pub author: String,
-    pub message: String,
-}
+    if forest.trees.is_empty() {
+        eprintln!("No commits found in repository.");
+        std::process::exit(1);
+    }
 
-/// Supported output modes.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OutputMode {
-    Interactive,
-    Animated,
-    Svg,
-    Static,
-}
+    println!("Found {} trees (branches) with {} commits total.", forest.trees.len(), forest.commit_map.len());
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let matches = App::new("git-forest")
-        .version("0.1.0")
-        .author("Git Forest Team")
-        .about("See your git history grow as an ASCII-art forest")
-        .arg(
-            Arg::with_name("path")
-                .help("Path to the git repository (default: current directory)")
-                .default_value(".")
-                .index(1),
-        )
-        .arg(
-            Arg::with_name("mode")
-                .short("m")
-                .long("mode")
-                .help("Output mode: interactive, animated, svg, static")
-                .possible_values(&["interactive", "animated", "svg", "static"])
-                .default_value("interactive"),
-        )
-        .arg(
-            Arg::with_name("output")
-                .short("o")
-                .long("output")
-                .help("Output file for SVG export (only used in svg mode)")
-                .default_value("forest.svg"),
-        )
-        .get_matches();
+    // Assign colors to authors
+    let author_colors = assign_author_colors(&forest);
+    println!("Assigned colors to {} authors.", author_colors.len());
 
-    let repo_path = matches.value_of("path").unwrap();
-    let mode_str = matches.value_of("mode").unwrap();
-    let output_path = matches.value_of("output").unwrap();
+    // Detect merge storms
+    let storms = detect_merge_storms(&forest);
+    if storms.is_empty() {
+        println!("No merge storms detected.");
+    } else {
+        println!("Detected {} merge storm(s).", storms.len());
+    }
 
-    let mode = match mode_str {
-        "interactive" => OutputMode::Interactive,
-        "animated" => OutputMode::Animated,
-        "svg" => OutputMode::Svg,
-        "static" => OutputMode::Static,
-        _ => unreachable!(),
-    };
+    // Layout the forest
+    let (width, height) = termion::terminal_size().unwrap_or((80, 24));
+    let layout = layout_forest(&forest, width as f64, height as f64);
+    println!("Layout computed: {} positions, {} merge positions.", layout.positions.len(), layout.merge_positions.len());
 
-    eprintln!("Opening repository at: {}", repo_path);
-    let repo = Repository::open(repo_path)?;
+    // Check for SVG export flag
+    if args.iter().any(|a| a == "--svg") || args.iter().any(|a| a == "-s") {
+        let svg_path = if args.len() > 2 {
+            &args[2]
+        } else {
+            "forest.svg"
+        };
+        export_svg(&forest, &layout, &author_colors, &storms, svg_path).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("SVG export failed: {}", e))
+        })?;
+        println!("Exported forest to {}", svg_path);
+        return Ok(());
+    }
 
-    let forest = build_forest(&repo)?;
-    eprintln!("Built forest with {} trees and {} merges", forest.trees.len(), forest.merges.len());
+    // Check for animation flag
+    let animate_flag = args.iter().any(|a| a == "--animate") || args.iter().any(|a| a == "-a");
 
-    match mode {
-        OutputMode::Interactive => {
-            eprintln!("Entering interactive mode. Use arrow keys to scroll, +/- to zoom, q to quit.");
-            interact::run_interactive(&forest)?;
+    if animate_flag {
+        // Animated mode
+        let mut state = AnimationState::default();
+        state.running = true;
+        println!("Starting animated forest view. Press 'q' to quit.");
+        let stdout = stdout();
+        let mut stdout = stdout.lock();
+        write!(stdout, "{}", cursor::Hide)?;
+        let mut stdin = stdin();
+        // We need non-blocking input; we'll use a polling approach
+        let mut last_update = Instant::now();
+        let frame_duration = Duration::from_millis(50);
+        let mut terminal_size = termion::terminal_size().unwrap_or((80, 24));
+
+        loop {
+            let now = Instant::now();
+            let delta = (now - last_update).as_secs_f64();
+            last_update = now;
+
+            // Check for keypress (non-blocking)
+            if let Some(Ok(key)) = stdin.lock().keys().next() {
+                match key {
+                    Key::Char('q') | Key::Char('Q') => break,
+                    Key::Char('r') => state.growth = 0.0,
+                    Key::Char('s') => state.season = (state.season + 1) % 4,
+                    _ => {}
+                }
+            }
+
+            // Update animation state
+            state.growth = (state.growth + delta * 0.3).min(1.0);
+            if state.growth >= 1.0 {
+                state.growth = 0.0;
+                state.season = (state.season + 1) % 4;
+            }
+
+            // Get current terminal size
+            if let Ok((w, h)) = termion::terminal_size() {
+                terminal_size = (w, h);
+            }
+
+            // Render frame
+            let frame = render_animated_frame(&forest, &layout, &mut state, terminal_size.0, terminal_size.1, delta);
+
+            // Write frame
+            write!(stdout, "{}{}{}", cursor::Goto(1, 1), clear::All, frame)?;
+            stdout.flush()?;
+
+            // Sleep for frame duration
+            std::thread::sleep(frame_duration);
         }
-        OutputMode::Animated => {
-            eprintln!("Starting animated forest (press Ctrl+C to stop)...");
-            animate::run_animation(&forest)?;
+
+        write!(stdout, "{}", cursor::Show)?;
+        stdout.flush()?;
+        println!("Animated view closed.");
+    } else {
+        // Interactive mode
+        let mut view = InteractiveView::default();
+        let stdout = stdout();
+        let mut stdout = stdout.into_raw_mode()?;
+        write!(stdout, "{}{}", clear::All, cursor::Hide)?;
+        stdout.flush()?;
+
+        let stdin = stdin();
+        let mut keys = stdin.keys();
+
+        loop {
+            // Re-render forest
+            let rendered = render_forest(&forest, &layout, &author_colors, &storms, &view);
+            write!(stdout, "{}", cursor::Goto(1, 1))?;
+            write!(stdout, "{}", rendered)?;
+            stdout.flush()?;
+
+            // Handle input
+            if let Some(Ok(key)) = keys.next() {
+                match key {
+                    Key::Char('q') | Key::Char('Q') => break,
+                    Key::Left => view.offset_x -= 0.1 / view.zoom,
+                    Key::Right => view.offset_x += 0.1 / view.zoom,
+                    Key::Up => view.offset_y -= 0.1 / view.zoom,
+                    Key::Down => view.offset_y += 0.1 / view.zoom,
+                    Key::Char('+') | Key::Char('=') => view.zoom = (view.zoom * 1.2).min(10.0),
+                    Key::Char('-') => view.zoom = (view.zoom / 1.2).max(0.1),
+                    Key::Char('i') => view.info_visible = !view.info_visible,
+                    Key::Char(' ') => {
+                        // Inspect commit at center of screen (or near center)
+                        let screen_x = width / 2;
+                        let screen_y = height / 2;
+                        if let Some(commit) = find_commit_at_position(&forest, screen_x, screen_y, &view) {
+                            view.selected_commit = Some(commit);
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
-        OutputMode::Svg => {
-            eprintln!("Exporting forest to SVG: {}", output_path);
-            let svg_content = svg::render_forest_svg(&forest)?;
-            std::fs::write(output_path, svg_content)?;
-            eprintln!("SVG saved to {}", output_path);
-        }
-        OutputMode::Static => {
-            eprintln!("Rendering static ASCII forest...");
-            let ascii = render_static(&forest);
-            println!("{}", ascii);
-        }
+
+        write!(stdout, "{}", cursor::Show)?;
+        stdout.suspend_raw_mode()?;
+        println!("Interactive view closed.");
     }
 
     Ok(())
 }
-
-/// Build a Forest from a git2 Repository.
-pub fn build_forest(repo: &Repository) -> Result<Forest, Box<dyn Error>> {
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
-    revwalk.set_sorting(git2::Sort::TIME)?;
-
-    let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
-    let mut parent_counts: HashMap<String, usize> = HashMap::new();
-
-    for oid_result in revwalk {
-        let oid = oid_result?;
-        let commit = repo.find_commit(oid)?;
-        let id = oid.to_string();
-        let author = commit.author().name().unwrap_or("unknown").to_string();
-        let time = commit.time().seconds();
-        let message = commit.message().unwrap_or("").to_string();
-        let parents: Vec<String> = commit.parents().map(|p| p.id().to_string()).collect();
-
-        commit_map.insert(id.clone(), CommitNode {
-            id: id.clone(),
-            author,
-            time,
-            message,
-            parents: parents.clone(),
-        });
-
-        *parent_counts.entry(id).or_insert(0) += 0;
-        for p in &parents {
-            *parent_counts.entry(p.clone()).or_insert(0) += 1;
-        }
-    }
-
-    // Identify merge commits (more than one parent)
-    let mut merges: Vec<MergeNode> = Vec::new();
-    for (id, node) in &commit_map {
-        if node.parents.len() > 1 {
-            let children: Vec<String> = commit_map.values()
-                .filter(|c| c.parents.contains(id))
-                .map(|c| c.id.clone())
-                .collect();
-            merges.push(MergeNode {
-                id: id.clone(),
-                parents: node.parents.clone(),
-                children,
-                time: node.time,
-                author: node.author.clone(),
-                message: node.message.clone(),
-            });
-        }
-    }
-
-    // Build trees by following linear chains (no merges)
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut trees: Vec<Tree> = Vec::new();
-
-    // Start from root commits (no children or all children visited)
-    let root_candidates: Vec<String> = commit_map.keys()
-        .filter(|id| {
-            // A root is a commit that has no children (leaf) or is the initial commit
-            let has_children = commit_map.values().any(|c| c.parents.contains(id));
-            !has_children || parent_counts.get(*id).copied().unwrap_or(0) == 0
-        })
-        .cloned()
-        .collect();
-
-    for root in &root_candidates {
-        if visited.contains(root) {
-            continue;
-        }
-        let mut commits: Vec<String> = Vec::new();
-        let mut current = root.clone();
-        loop {
-            if visited.contains(&current) {
-                break;
-            }
