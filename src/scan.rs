@@ -1,184 +1,144 @@
 use crate::{CommitNode, Forest, Tree, MergeNode};
-use git2::Repository;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::error::Error;
+use git2::{Repository, Oid, Sort};
+use std::collections::{HashMap, HashSet};
 
 /// Scan a git repository and build a Forest data structure.
-pub fn scan_repository(repo_path: &str) -> Result<Forest, Box<dyn Error>> {
-    let repo = Repository::open(repo_path)?;
-    let mut revwalk = repo.revwalk()?;
-    revwalk.push_head()?;
-    revwalk.set_sorting(git2::Sort::TIME)?;
+pub fn scan_repository(path: &str) -> Result<Forest, String> {
+    let repo = Repository::open(path).map_err(|e| format!("Failed to open repository: {}", e))?;
+    let mut revwalk = repo.revwalk().map_err(|e| format!("Failed to create revwalk: {}", e))?;
+    revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|e| format!("Failed to set sorting: {}", e))?;
+    revwalk.push_head().map_err(|e| format!("Failed to push HEAD: {}", e))?;
 
     let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
-    let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut child_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut branch_heads: HashMap<String, String> = HashMap::new(); // branch name -> commit id
 
     // Collect all commits
     for oid_result in revwalk {
-        let oid = oid_result?;
-        let commit = repo.find_commit(oid)?;
+        let oid = oid_result.map_err(|e| format!("Revwalk error: {}", e))?;
+        let commit = repo.find_commit(oid).map_err(|e| format!("Failed to find commit: {}", e))?;
         let id = oid.to_string();
         let author = commit.author().name().unwrap_or("unknown").to_string();
-        let time = commit.time().seconds();
         let message = commit.message().unwrap_or("").to_string();
-        let parents: Vec<String> = commit.parents().map(|p| p.id().to_string()).collect();
+        let time = commit.time().seconds() as u64;
+        let parent_ids: Vec<String> = commit.parents().map(|p| p.id().to_string()).collect();
 
         let node = CommitNode {
             id: id.clone(),
+            message,
             author,
             time,
-            message,
-            parents: parents.clone(),
+            parent_ids: parent_ids.clone(),
+            children: Vec::new(),
         };
         commit_map.insert(id.clone(), node);
+        parent_map.insert(id.clone(), parent_ids.clone());
 
-        for parent in &parents {
-            children_map.entry(parent.clone()).or_default().push(id.clone());
+        for pid in &parent_ids {
+            child_map.entry(pid.clone()).or_insert_with(Vec::new).push(id.clone());
         }
     }
 
-    // Find root commits (no parents in the repository)
-    let roots: Vec<String> = commit_map.keys()
-        .filter(|id| {
-            if let Some(node) = commit_map.get(*id) {
-                node.parents.is_empty() || node.parents.iter().all(|p| !commit_map.contains_key(p))
-            } else {
-                false
+    // Populate children in commit_map
+    for (child_id, parents) in &parent_map {
+        for pid in parents {
+            if let Some(parent_node) = commit_map.get_mut(pid) {
+                parent_node.children.push(child_id.clone());
             }
-        })
-        .cloned()
-        .collect();
+        }
+    }
 
-    // Build trees by following linear chains from roots
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut trees: Vec<Tree> = Vec::new();
-    let mut merge_points: Vec<MergeNode> = Vec::new();
-
-    for root in &roots {
-        let mut current = root.clone();
-        let mut commits_in_tree: Vec<String> = Vec::new();
-
-        loop {
-            if visited.contains(&current) {
-                break;
-            }
-            visited.insert(current.clone());
-            commits_in_tree.push(current.clone());
-
-            let node = match commit_map.get(&current) {
-                Some(n) => n,
-                None => break,
-            };
-
-            // Find child commits
-            let children = children_map.get(&current).cloned().unwrap_or_default();
-
-            if children.len() == 1 {
-                // Continue linear chain
-                current = children[0].clone();
-            } else if children.len() > 1 {
-                // This is a merge point: multiple children (branches originating here)
-                merge_points.push(MergeNode {
-                    id: current.clone(),
-                    parents: node.parents.clone(),
-                    children: children.clone(),
-                });
-                // For each child except the first, start a new tree
-                for child in children.iter().skip(1) {
-                    if !visited.contains(child) {
-                        let mut subtree_commits: Vec<String> = Vec::new();
-                        let mut sub_current = child.clone();
-                        loop {
-                            if visited.contains(&sub_current) {
-                                break;
-                            }
-                            visited.insert(sub_current.clone());
-                            subtree_commits.push(sub_current.clone());
-                            let sub_children = children_map.get(&sub_current).cloned().unwrap_or_default();
-                            if sub_children.len() == 1 {
-                                sub_current = sub_children[0].clone();
-                            } else {
-                                break;
-                            }
-                        }
-                        if !subtree_commits.is_empty() {
-                            let author = commit_map.get(&subtree_commits[0])
-                                .map(|c| c.author.clone())
-                                .unwrap_or_default();
-                            trees.push(Tree {
-                                root: subtree_commits[0].clone(),
-                                commits: subtree_commits,
-                                color: (0, 0, 0), // will be assigned later
-                                author,
-                            });
-                        }
+    // Identify branch heads (local branches)
+    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+        for branch_result in branches {
+            if let Ok((branch, _)) = branch_result {
+                if let Some(name) = branch.name().ok().flatten() {
+                    if let Some(target) = branch.get().target() {
+                        branch_heads.insert(name.to_string(), target.to_string());
                     }
                 }
-                // Continue with the first child
-                if !children.is_empty() {
-                    current = children[0].clone();
-                } else {
-                    break;
-                }
-            } else {
-                // No children: leaf
-                break;
             }
         }
+    }
 
-        if !commits_in_tree.is_empty() {
-            let author = commit_map.get(&commits_in_tree[0])
-                .map(|c| c.author.clone())
-                .unwrap_or_default();
-            trees.push(Tree {
-                root: commits_in_tree[0].clone(),
-                commits: commits_in_tree,
-                color: (0, 0, 0),
-                author,
-            });
+    // Build trees: each branch head becomes a tree root, but we merge branches that share history
+    let mut tree_roots: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    // Start from branch heads and walk backwards, marking commits as belonging to that tree
+    for (branch_name, head_id) in &branch_heads {
+        if !visited.contains(head_id) {
+            tree_roots.push(head_id.clone());
+            // Mark all ancestors as visited for this tree
+            let mut stack = vec![head_id.clone()];
+            while let Some(current) = stack.pop() {
+                if visited.contains(&current) {
+                    continue;
+                }
+                visited.insert(current.clone());
+                if let Some(parents) = parent_map.get(&current) {
+                    for parent in parents {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
         }
     }
 
-    // Assign colors to trees based on author (simple hash-based)
-    let mut author_color_index: HashMap<String, usize> = HashMap::new();
-    let color_palette: [(u8, u8, u8); 8] = [
-        (34, 139, 34),   // forest green
-        (139, 69, 19),   // saddle brown
-        (70, 130, 180),  // steel blue
-        (218, 165, 32),  // goldenrod
-        (255, 69, 0),    // red-orange
-        (75, 0, 130),    // indigo
-        (0, 139, 139),   // dark cyan
-        (139, 0, 139),   // dark magenta
-    ];
-
-    for tree in &mut trees {
-        let count = author_color_index.len();
-        let idx = *author_color_index.entry(tree.author.clone())
-            .or_insert(count % color_palette.len());
-        tree.color = color_palette[idx];
+    // If no branches found, use HEAD
+    if tree_roots.is_empty() {
+        if let Ok(head) = repo.head() {
+            if let Some(target) = head.target() {
+                tree_roots.push(target.to_string());
+            }
+        }
     }
 
-    // Collect all merge commits that are not already in merge_points
-    for node in commit_map.values() {
-        if node.parents.len() > 1 {
-            // This is a merge commit (multiple parents)
-            if !merge_points.iter().any(|m| m.id == node.id) {
-                let children = children_map.get(&node.id).cloned().unwrap_or_default();
-                merge_points.push(MergeNode {
-                    id: node.id.clone(),
-                    parents: node.parents.clone(),
-                    children,
+    // Build trees
+    let mut trees: Vec<Tree> = Vec::new();
+    for root_id in &tree_roots {
+        let mut commit_ids: Vec<String> = Vec::new();
+        let mut stack = vec![root_id.clone()];
+        let mut local_visited: HashSet<String> = HashSet::new();
+        while let Some(current) = stack.pop() {
+            if local_visited.contains(&current) {
+                continue;
+            }
+            local_visited.insert(current.clone());
+            commit_ids.push(current.clone());
+            if let Some(parents) = parent_map.get(&current) {
+                for parent in parents {
+                    if !local_visited.contains(parent) {
+                        stack.push(parent.clone());
+                    }
+                }
+            }
+        }
+        trees.push(Tree {
+            root: root_id.clone(),
+            commits: commit_ids,
+        });
+    }
+
+    // Detect merge nodes (commits with more than one parent)
+    let mut merge_nodes: Vec<MergeNode> = Vec::new();
+    for (id, parents) in &parent_map {
+        if parents.len() > 1 {
+            if let Some(commit) = commit_map.get(id) {
+                merge_nodes.push(MergeNode {
+                    id: id.clone(),
+                    parent_ids: parents.clone(),
+                    child_ids: commit.children.clone(),
+                    timestamp: commit.time,
                 });
             }
         }
     }
 
-    let forest = Forest {
+    Ok(Forest {
         commit_map,
         trees,
-        merge_points,
-    };
-
-    Ok(forest)
+        merge_nodes,
+    })
 }
