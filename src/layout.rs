@@ -1,165 +1,211 @@
-use crate::{CommitNode, Forest, Tree, MergeNode};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::{Forest, Tree, CommitNode, MergeNode};
+use std::collections::{HashMap, VecDeque};
 
-/// Result of layout: positions of all commits and merge nodes.
+/// Represents a 2D position for a tree or commit node
 #[derive(Debug, Clone)]
-pub struct LayoutResult {
-    /// Commit positions keyed by commit id (x:0..1, y:0..1)
-    pub positions: HashMap<String, (f64, f64)>,
-    /// Merge node positions
-    pub merge_positions: HashMap<String, (f64, f64)>,
-    /// For each tree, its horizontal center (x coordinate)
-    pub tree_centers: Vec<f64>,
-    /// Depth (branch level) for each commit: 0 = main trunk, higher = side branches
-    pub branch_levels: HashMap<String, usize>,
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
 }
 
-/// Layout the forest on a 2D grid with gravitational pull between related commits.
-/// Returns positions normalized to [0,1] range.
-pub fn layout_forest(forest: &Forest, width: f64, height: f64) -> LayoutResult {
-    let tree_count = forest.trees.len();
-    if tree_count == 0 {
-        return LayoutResult {
-            positions: HashMap::new(),
-            merge_positions: HashMap::new(),
-            tree_centers: vec![],
-            branch_levels: HashMap::new(),
+/// Layout configuration parameters
+pub struct LayoutConfig {
+    /// Horizontal spacing between trees (branches)
+    pub tree_spacing: f64,
+    /// Vertical spacing between commits on the same branch
+    pub commit_spacing: f64,
+    /// Gravitational pull strength toward parent commits
+    pub gravity: f64,
+    /// Number of layout iterations for convergence
+    pub iterations: usize,
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        LayoutConfig {
+            tree_spacing: 6.0,
+            commit_spacing: 1.0,
+            gravity: 0.1,
+            iterations: 50,
+        }
+    }
+}
+
+/// Compute 2D positions for all trees and commits in the forest.
+/// Uses a topological sort then applies gravitational pull between related commits.
+pub fn layout_forest(forest: &Forest, config: &LayoutConfig) -> HashMap<String, Position> {
+    let mut positions: HashMap<String, Position> = HashMap::new();
+    
+    // Assign initial positions based on branch order and commit depth
+    let branch_names: Vec<&String> = forest.trees.keys().collect();
+    let mut x_offset = 0.0;
+    for branch_name in &branch_names {
+        if let Some(tree) = forest.trees.get(*branch_name) {
+            let mut y_offset = 0.0;
+            // Sort commits by timestamp (assuming they are stored in order)
+            let mut commits: Vec<&CommitNode> = tree.commits.values().collect();
+            commits.sort_by_key(|c| c.timestamp);
+            for commit in &commits {
+                positions.insert(commit.id.clone(), Position {
+                    x: x_offset,
+                    y: y_offset,
+                });
+                y_offset += config.commit_spacing;
+            }
+            x_offset += config.tree_spacing;
+        }
+    }
+    
+    // Apply gravitational pull toward parent commits (iteratively)
+    for _ in 0..config.iterations {
+        let mut new_positions = positions.clone();
+        for (commit_id, pos) in &positions {
+            // Find parent commits
+            let parents = find_parents(forest, commit_id);
+            if parents.is_empty() {
+                continue;
+            }
+            // Compute average position of parents
+            let mut avg_x = 0.0;
+            let mut avg_y = 0.0;
+            let mut count = 0.0;
+            for parent_id in &parents {
+                if let Some(parent_pos) = positions.get(parent_id) {
+                    avg_x += parent_pos.x;
+                    avg_y += parent_pos.y;
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                avg_x /= count;
+                avg_y /= count;
+                // Pull current commit toward parent average
+                let dx = avg_x - pos.x;
+                let dy = avg_y - pos.y;
+                let new_x = pos.x + dx * config.gravity;
+                let new_y = pos.y + dy * config.gravity;
+                new_positions.insert(commit_id.clone(), Position { x: new_x, y: new_y });
+            }
+        }
+        positions = new_positions;
+    }
+    
+    // Normalize positions to avoid negative coordinates
+    let min_x = positions.values().map(|p| p.x).fold(f64::INFINITY, f64::min);
+    let min_y = positions.values().map(|p| p.y).fold(f64::INFINITY, f64::min);
+    for pos in positions.values_mut() {
+        pos.x -= min_x;
+        pos.y -= min_y;
+    }
+    
+    positions
+}
+
+/// Find parent commit IDs for a given commit ID.
+/// Searches across all trees and merge nodes.
+fn find_parents(forest: &Forest, commit_id: &str) -> Vec<String> {
+    let mut parents = Vec::new();
+    
+    // Search in all trees
+    for tree in forest.trees.values() {
+        if let Some(commit) = tree.commits.get(commit_id) {
+            for parent_id in &commit.parents {
+                parents.push(parent_id.clone());
+            }
+            break;
+        }
+    }
+    
+    // Also check merge nodes
+    for merge in &forest.merges {
+        if merge.commit_id == commit_id {
+            for parent_id in &merge.parents {
+                parents.push(parent_id.clone());
+            }
+        }
+    }
+    
+    parents
+}
+
+/// Build a tree structure from a set of commits (lineage).
+/// Returns the trunk as a series of positions (bottom to top).
+pub fn build_tree_trunk(
+    positions: &HashMap<String, Position>,
+    branch_commits: &[&CommitNode],
+) -> Vec<Position> {
+    let mut trunk: Vec<Position> = Vec::new();
+    for commit in branch_commits {
+        if let Some(pos) = positions.get(&commit.id) {
+            trunk.push(pos.clone());
+        }
+    }
+    // Sort by y ascending (bottom to top)
+    trunk.sort_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+    trunk
+}
+
+/// Compute branch taper for visual thickness (wider at bottom, narrower at top).
+pub fn compute_branch_thickness(y: f64, max_y: f64, min_thickness: f64, max_thickness: f64) -> f64 {
+    if max_y == 0.0 {
+        return max_thickness;
+    }
+    let ratio = y / max_y;
+    max_thickness - (max_thickness - min_thickness) * ratio
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Forest, Tree, CommitNode, MergeNode};
+    
+    fn make_test_forest() -> Forest {
+        let mut forest = Forest {
+            trees: HashMap::new(),
+            merges: Vec::new(),
+            commit_map: HashMap::new(),
         };
+        
+        let mut tree = Tree {
+            branch_name: "main".to_string(),
+            commits: HashMap::new(),
+        };
+        
+        let commit1 = CommitNode {
+            id: "aaa".to_string(),
+            author: "alice".to_string(),
+            message: "initial".to_string(),
+            timestamp: 1000,
+            parents: vec![],
+            children: vec!["bbb".to_string()],
+        };
+        let commit2 = CommitNode {
+            id: "bbb".to_string(),
+            author: "alice".to_string(),
+            message: "second".to_string(),
+            timestamp: 1001,
+            parents: vec!["aaa".to_string()],
+            children: vec![],
+        };
+        
+        tree.commits.insert("aaa".to_string(), commit1);
+        tree.commits.insert("bbb".to_string(), commit2);
+        
+        forest.trees.insert("main".to_string(), tree);
+        forest.commit_map.insert("alice".to_string(), vec!["aaa".to_string(), "bbb".to_string()]);
+        
+        forest
     }
-
-    // 1. Assign each tree a horizontal position (evenly spaced with some jitter based on age)
-    let mut tree_centers: Vec<f64> = Vec::with_capacity(tree_count);
-    let spacing = 1.0 / (tree_count as f64 + 1.0);
-    for i in 0..tree_count {
-        let base = spacing * (i as f64 + 1.0);
-        // Add small jitter based on root commit time to avoid perfect alignment
-        let root_id = &forest.trees[i].root;
-        let root_node = forest.commit_map.get(root_id);
-        let jitter = root_node.map_or(0.0, |c| (c.time as f64 % 1000.0) / 10000.0);
-        tree_centers.push((base + jitter * 0.1).clamp(0.02, 0.98));
-    }
-
-    let mut positions: HashMap<String, (f64, f64)> = HashMap::new();
-    let mut merge_positions: HashMap<String, (f64, f64)> = HashMap::new();
-    let mut branch_levels: HashMap<String, usize> = HashMap::new();
-
-    // 2. Compute topological order (BFS from roots)
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    let mut children: HashMap<String, Vec<String>> = HashMap::new();
-    for (id, _) in &forest.commit_map {
-        in_degree.entry(id.clone()).or_insert(0);
-        children.entry(id.clone()).or_insert_with(Vec::new);
-    }
-    for (id, node) in &forest.commit_map {
-        for parent in &node.parents {
-            children.entry(parent.clone()).or_insert_with(Vec::new).push(id.clone());
-            *in_degree.entry(id.clone()).or_insert(0) += 1;
-        }
-    }
-
-    // 3. Assign branch levels via DFS from root, tracking depth along each path
-    // We process trees in order, assigning level 0 to the trunk (longest path from root)
-    for tree in &forest.trees {
-        let root_id = &tree.root;
-        // First, find all commits in this tree
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
-        queue.push_back(root_id.clone());
-        visited.insert(root_id.clone());
-        while let Some(id) = queue.pop_front() {
-            if let Some(node) = forest.commit_map.get(&id) {
-                for child in children.get(&id).unwrap_or(&vec![]) {
-                    if visited.insert(child.clone()) {
-                        queue.push_back(child.clone());
-                    }
-                }
-            }
-        }
-
-        // Now assign levels: root = 0, each child = parent's level + 1, but merges get min of parents
-        let mut topo: Vec<String> = Vec::new();
-        let mut in_deg_local: HashMap<String, usize> = HashMap::new();
-        for id in &visited {
-            in_deg_local.insert(id.clone(), 0);
-        }
-        for id in &visited {
-            if let Some(node) = forest.commit_map.get(id) {
-                for parent in &node.parents {
-                    if visited.contains(parent) {
-                        *in_deg_local.entry(id.clone()).or_insert(0) += 1;
-                    }
-                }
-            }
-        }
-        let mut q: VecDeque<String> = VecDeque::new();
-        for (id, deg) in &in_deg_local {
-            if *deg == 0 {
-                q.push_back(id.clone());
-            }
-        }
-        while let Some(id) = q.pop_front() {
-            topo.push(id.clone());
-            if let Some(node) = forest.commit_map.get(&id) {
-                for child in children.get(&id).unwrap_or(&vec![]) {
-                    if visited.contains(child) {
-                        if let Some(deg) = in_deg_local.get_mut(child) {
-                            *deg -= 1;
-                            if *deg == 0 {
-                                q.push_back(child.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Assign levels: for each commit, level = max(parent levels) + 1, but for merges take min of parents
-        for id in &topo {
-            if id == root_id {
-                branch_levels.insert(id.clone(), 0);
-            } else if let Some(node) = forest.commit_map.get(id) {
-                let parent_levels: Vec<usize> = node.parents.iter()
-                    .filter(|p| visited.contains(*p))
-                    .filter_map(|p| branch_levels.get(p))
-                    .cloned()
-                    .collect();
-                if parent_levels.is_empty() {
-                    branch_levels.insert(id.clone(), 0);
-                } else if node.parents.len() > 1 {
-                    // Merge: take minimum parent level (closer to trunk)
-                    let min_level = parent_levels.iter().min().cloned().unwrap_or(0);
-                    branch_levels.insert(id.clone(), min_level);
-                } else {
-                    let max_level = parent_levels.iter().max().cloned().unwrap_or(0);
-                    branch_levels.insert(id.clone(), max_level + 1);
-                }
-            }
-        }
-    }
-
-    // 4. Place commits vertically by topological order, horizontally by tree center + branch offset
-    // Use a simple layered approach: assign each commit a 'layer' (depth from root via longest path)
-    let mut commit_order: Vec<&String> = forest.commit_map.keys().collect();
-    // Sort by time ascending (root earliest)
-    commit_order.sort_by(|a, b| {
-        let ca = forest.commit_map.get(a).map(|c| c.time).unwrap_or(0);
-        let cb = forest.commit_map.get(b).map(|c| c.time).unwrap_or(0);
-        ca.cmp(&cb)
-    });
-
-    // Group commits by their tree assignment
-    let mut commit_to_tree: HashMap<String, usize> = HashMap::new();
-    for (i, tree) in forest.trees.iter().enumerate() {
-        let mut stack: Vec<String> = vec![tree.root.clone()];
-        let mut visited: HashSet<String> = HashSet::new();
-        while let Some(id) = stack.pop() {
-            if visited.insert(id.clone()) {
-                commit_to_tree.insert(id.clone(), i);
-                if let Some(node) = forest.commit_map.get(&id) {
-                    for child in &node.children {
-                        stack.push(child.clone());
-                    }
-                }
-            }
-        }
+    
+    #[test]
+    fn test_layout_simple() {
+        let forest = make_test_forest();
+        let config = LayoutConfig::default();
+        let positions = layout_forest(&forest, &config);
+        
+        assert!(positions.contains_key("aaa"));
+        assert!(positions.contains_key("bbb"));
+        
+        // bbb should be above aaa (higher y)
+        assert!(positions["bbb"].y > positions["aaa"].y);
     }
