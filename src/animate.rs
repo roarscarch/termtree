@@ -15,6 +15,10 @@ pub struct AnimationState {
     pub running: bool,
     /// Timestamp of last frame
     pub last_frame: Instant,
+    /// Elapsed time for idle sway (in seconds)
+    pub sway_time: f64,
+    /// Sway amplitude per tree (index -> amplitude)
+    pub sway_amplitudes: Vec<f64>,
 }
 
 impl Default for AnimationState {
@@ -24,6 +28,8 @@ impl Default for AnimationState {
             season: 0,
             running: false,
             last_frame: Instant::now(),
+            sway_time: 0.0,
+            sway_amplitudes: Vec::new(),
         }
     }
 }
@@ -38,143 +44,119 @@ pub fn render_animated_frame(
     height: u16,
     delta: f64,
 ) -> String {
+    state.sway_time += delta;
     let mut output = String::new();
-    let w = width as usize;
-    let h = height as usize;
-    let mut screen = vec![vec![' '; w]; h];
-    let mut colors = vec![vec![(255u8, 255u8, 255u8); w]; h];
+    output.push_str(&format!("{}{}", termion::clear::All, termion::cursor::Goto(1, 1)));
 
-    // Update growth progress
-    state.growth += delta * 0.3;
-    if state.growth > 1.0 {
-        state.growth = 1.0;
+    // background
+    let (bg_r, bg_g, bg_b) = match state.season {
+        0 => (135, 206, 235), // spring: sky blue
+        1 => (100, 180, 255), // summer: deeper blue
+        2 => (200, 180, 100), // autumn: golden
+        3 => (220, 220, 255), // winter: pale
+        _ => (135, 206, 235),
+    };
+    for y in 0..height {
+        for x in 0..width {
+            output.push_str(&format!(
+                "{}{} ",
+                color::Bg(color::Rgb(bg_r, bg_g, bg_b)),
+                color::Fg(color::Reset)
+            ));
+        }
+        if y < height - 1 {
+            output.push_str("\r\
+");
+        }
+    }
+    output.push_str(&format!("{} ", color::Bg(color::Reset)));
+
+    // Ensure sway amplitudes allocated
+    let tree_count = forest.trees.len();
+    if state.sway_amplitudes.len() != tree_count {
+        state.sway_amplitudes = vec![0.0; tree_count];
+        for i in 0..tree_count {
+            state.sway_amplitudes[i] = 0.5 + (i as f64 * 0.3).fract(); // pseudo-random
+        }
     }
 
-    // Update season (roughly every 5 seconds at 60fps)
-    state.season = ((state.last_frame.elapsed().as_secs_f64() / 5.0) as u8) % 4;
-
-    for (i, tree) in forest.trees.iter().enumerate() {
-        if i >= layout.tree_centers.len() {
-            continue;
-        }
-        let center_x = layout.tree_centers[i];
-        let screen_x = (center_x * (w as f64 - 1.0)) as usize;
-        if screen_x >= w { continue; }
-
-        let trunk_height = (h as f64 * 0.6 * state.growth) as usize;
-        let leaf_start = h.saturating_sub(trunk_height);
+    // Draw trees with sway
+    for (tree_idx, tree) in forest.trees.iter().enumerate() {
+        let sway_offset = (state.sway_time * 1.5 + state.sway_amplitudes[tree_idx] * 6.28).sin()
+            * state.sway_amplitudes[tree_idx]
+            * 2.0;
+        let base_x = tree.x as f64 + sway_offset;
+        let base_y = tree.y as f64;
+        let trunk_height = (tree.branches.len() as f64) * 2.0;
+        let visible_height = trunk_height * state.growth;
+        let start_y = base_y.floor() as u16;
+        let end_y = (base_y - visible_height).max(0.0).floor() as u16;
 
         // Draw trunk
-        let trunk_color = tree.color;
-        for y in leaf_start..h {
-            if y < h && screen_x < w {
-                screen[y][screen_x] = '|';
-                colors[y][screen_x] = trunk_color;
+        let trunk_char = '║';
+        for y in end_y..start_y {
+            if y < height {
+                let x_pos = (base_x.round() as u16).min(width.saturating_sub(1));
+                let (trunk_r, trunk_g, trunk_b) = (101, 67, 33); // brown
+                output.push_str(&format!(
+                    "{}{}{}",
+                    termion::cursor::Goto(x_pos + 1, y + 1),
+                    color::Fg(color::Rgb(trunk_r, trunk_g, trunk_b)),
+                    trunk_char
+                ));
             }
         }
 
-        // Draw leaves (proportional to commit frequency)
-        let leaf_density = (tree.commits.len() as f64).sqrt() as usize;
-        for _ in 0..leaf_density.min(5) {
-            let leaf_y = leaf_start + fastrand::usize(0..trunk_height.max(1));
-            let leaf_x = screen_x + fastrand::i32(-2..=2) as usize;
-            if leaf_y < h && leaf_x < w {
-                let leaf_char = match state.season {
-                    0 => '*', // spring buds
-                    1 => '@', // summer full
-                    2 => '%', // autumn
-                    _ => '.', // winter sparse
+        // Draw branches with sway
+        for (branch_idx, branch) in tree.branches.iter().enumerate() {
+            let branch_sway = (state.sway_time * 2.0 + branch_idx as f64 * 0.7).sin()
+                * state.sway_amplitudes[tree_idx]
+                * 1.5;
+            let branch_x = base_x + branch.offset_x as f64 + branch_sway;
+            let branch_y = base_y - (branch_idx as f64) * 2.0 - 1.0;
+            if branch_y >= 0.0 && branch_y < height as f64 {
+                let x_pos = (branch_x.round() as u16).min(width.saturating_sub(1));
+                let y_pos = branch_y as u16;
+                let branch_char = match branch.direction {
+                    crate::BranchDirection::Left => '/',
+                    crate::BranchDirection::Right => '\\',
+                    crate::BranchDirection::Straight => '|',
                 };
-                screen[leaf_y][leaf_x] = leaf_char;
-                let leaf_color = match state.season {
-                    0 => (100, 200, 100), // light green
-                    1 => (50, 180, 50),   // dark green
-                    2 => (200, 100, 50),  // orange
-                    _ => (150, 150, 150), // gray
-                };
-                colors[leaf_y][leaf_x] = leaf_color;
+                let (branch_r, branch_g, branch_b) = (139, 90, 43);
+                output.push_str(&format!(
+                    "{}{}{}",
+                    termion::cursor::Goto(x_pos + 1, y_pos + 1),
+                    color::Fg(color::Rgb(branch_r, branch_g, branch_b)),
+                    branch_char
+                ));
+            }
+        }
+
+        // Draw leaves with season color and leaf density
+        let leaf_color = match state.season {
+            0 => (34, 139, 34),   // spring green
+            1 => (0, 200, 0),     // summer green
+            2 => (255, 140, 0),   // autumn orange
+            3 => (200, 200, 200), // winter gray
+            _ => (34, 139, 34),
+        };
+        let leaf_density = (tree.commit_count as f64 / 50.0).min(1.0) * state.growth;
+        let leaf_count = (leaf_density * 20.0) as u16;
+        for i in 0..leaf_count {
+            let leaf_angle = (state.sway_time * 3.0 + i as f64 * 1.1) * 0.3;
+            let leaf_radius = 2.0 + (i as f64 * 0.5).fract() * 3.0;
+            let leaf_x = base_x + leaf_angle.cos() * leaf_radius;
+            let leaf_y = base_y - trunk_height * state.growth - 2.0 + leaf_angle.sin() * leaf_radius;
+            if leaf_y >= 0.0 && leaf_y < height as f64 && leaf_x >= 0.0 && leaf_x < width as f64 {
+                let x_pos = leaf_x as u16;
+                let y_pos = leaf_y as u16;
+                let leaf_char = if state.season == 3 { '.' } else { '*' };
+                output.push_str(&format!(
+                    "{}{}{}",
+                    termion::cursor::Goto(x_pos + 1, y_pos + 1),
+                    color::Fg(color::Rgb(leaf_color.0, leaf_color.1, leaf_color.2)),
+                    leaf_char
+                ));
             }
         }
     }
-
-    // Draw merge nodes as root systems
-    for (merge_id, pos) in &layout.merge_positions {
-        let mx = (pos.0 * (w as f64 - 1.0)) as usize;
-        let my = (pos.1 * (h as f64 - 1.0)) as usize;
-        if mx < w && my < h {
-            screen[my][mx] = '#';
-            colors[my][mx] = (139, 69, 19); // brown
-        }
-    }
-
-    // Build output string with ANSI color codes
-    use termion::color::Fg;
-    use termion::color::Bg;
-    for y in 0..h {
-        for x in 0..w {
-            let (r, g, b) = colors[y][x];
-            let fg = Fg(color::Rgb(r, g, b));
-            output.push_str(&format!("{}{}", fg, screen[y][x]));
-        }
-        if y < h - 1 {
-            output.push('\n');
-        }
-    }
-    // Reset color
-    output.push_str(&format!("{}", color::Fg(color::Reset)));
-    output
-}
-
-/// Run the animation loop for a fixed duration.
-pub fn run_animation(forest: &Forest, layout: &LayoutResult, duration_secs: f64) -> Result<(), Box<dyn std::error::Error>> {
-    let mut stdout = stdout().into_raw_mode()?;
-    let (width, height) = termion::terminal_size()?;
-    let mut state = AnimationState::default();
-    let start = Instant::now();
-    let mut last_frame = Instant::now();
-
-    write!(stdout, "{}", termion::clear::All)?;
-    write!(stdout, "{}", termion::cursor::Hide)?;
-
-    loop {
-        let elapsed = start.elapsed().as_secs_f64();
-        if elapsed > duration_secs {
-            break;
-        }
-        let delta = last_frame.elapsed().as_secs_f64();
-        last_frame = Instant::now();
-
-        let frame = render_animated_frame(forest, layout, &mut state, width, height, delta);
-        write!(stdout, "{}", termion::cursor::Goto(1, 1))?;
-        write!(stdout, "{}", frame)?;
-        stdout.flush()?;
-
-        // Cap at ~30fps
-        let frame_duration = Duration::from_secs_f64(1.0 / 30.0);
-        let remaining = frame_duration.saturating_sub(last_frame.elapsed());
-        if remaining > Duration::from_millis(1) {
-            thread::sleep(remaining);
-        }
-    }
-
-    write!(stdout, "{}", termion::cursor::Show)?;
-    write!(stdout, "{}", termion::clear::All)?;
-    stdout.flush()?;
-    Ok(())
-}
-
-/// Render a static ASCII frame (no animation) for export or fallback.
-pub fn render_static_frame(
-    forest: &Forest,
-    layout: &LayoutResult,
-    width: u16,
-    height: u16,
-) -> String {
-    let mut state = AnimationState {
-        growth: 1.0,
-        season: 1,
-        running: false,
-        last_frame: Instant::now(),
-    };
-    render_animated_frame(forest, layout, &mut state, width, height, 0.0)
-}
