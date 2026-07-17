@@ -1,216 +1,184 @@
-use crate::{Forest, Tree, CommitNode, LayoutResult};
-use std::collections::{HashMap, HashSet};
+use crate::{Forest, Tree, CommitNode, MergeNode};
+use std::collections::{HashSet, HashMap};
 
-/// Configuration for forest pruning
-#[derive(Debug, Clone)]
-pub struct PruneConfig {
-    /// Minimum number of commits for a branch to be kept (0 = keep all)
-    pub min_commits: usize,
-    /// Maximum age in days for a branch tip to be considered alive (0 = no age limit)
-    pub max_tip_age_days: u64,
-    /// Whether to remove orphaned merge nodes (merges whose parents are both pruned)
-    pub remove_orphan_merges: bool,
-    /// Whether to reattach orphaned commits to nearest alive ancestor
-    pub reattach_orphans: bool,
-}
-
-impl Default for PruneConfig {
-    fn default() -> Self {
-        PruneConfig {
-            min_commits: 2,
-            max_tip_age_days: 0,
-            remove_orphan_merges: true,
-            reattach_orphans: false,
-        }
-    }
-}
-
-/// Result of pruning operation
-#[derive(Debug, Clone)]
-pub struct PruneResult {
-    /// Number of branches removed
-    pub branches_removed: usize,
-    /// Number of commits removed
-    pub commits_removed: usize,
-    /// Number of merges removed
-    pub merges_removed: usize,
-    /// IDs of removed branches
-    pub removed_branches: Vec<String>,
-    /// Whether the forest was modified
-    pub modified: bool,
-}
-
-/// Prune dead branches from the forest according to configuration.
-/// Returns the pruned forest and a result summary.
-pub fn prune_forest(
-    forest: &Forest,
-    config: &PruneConfig,
-    layout: &LayoutResult,
-) -> (Forest, PruneResult) {
-    let mut result = PruneResult {
-        branches_removed: 0,
-        commits_removed: 0,
-        merges_removed: 0,
-        removed_branches: Vec::new(),
-        modified: false,
-    };
-
-    // Identify branches to keep
-    let branches_to_keep = identify_branches_to_keep(forest, config);
-
-    if branches_to_keep.len() == forest.trees.len() {
-        // No pruning needed
-        return (forest.clone(), result);
-    }
-
-    // Build set of commit IDs to keep (from kept branches and their ancestors)
-    let commits_to_keep = collect_commits_to_keep(forest, &branches_to_keep);
-
-    // Build new forest
-    let mut new_forest = Forest {
-        trees: Vec::new(),
-        commit_map: HashMap::new(),
-        merge_nodes: Vec::new(),
-        ..forest.clone()
-    };
-
-    // Filter trees
-    for tree in &forest.trees {
-        if branches_to_keep.contains(&tree.branch_name) {
-            new_forest.trees.push(tree.clone());
-        } else {
-            result.branches_removed += 1;
-            result.removed_branches.push(tree.branch_name.clone());
-        }
-    }
-
-    // Filter commits
-    for (id, commit) in &forest.commit_map {
-        if commits_to_keep.contains(id) {
-            new_forest.commit_map.insert(id.clone(), commit.clone());
-        } else {
-            result.commits_removed += 1;
-        }
-    }
-
-    // Filter merge nodes
-    if config.remove_orphan_merges {
-        for merge in &forest.merge_nodes {
-            let parents_alive = merge.parents.iter()
-                .all(|p| commits_to_keep.contains(p));
-            if parents_alive || !config.remove_orphan_merges {
-                new_forest.merge_nodes.push(merge.clone());
-            } else {
-                result.merges_removed += 1;
-            }
-        }
-    } else {
-        new_forest.merge_nodes = forest.merge_nodes.clone();
-    }
-
-    // Optionally reattach orphans
-    if config.reattach_orphans {
-        new_forest = reattach_orphaned_commits(&new_forest, &commits_to_keep, layout);
-    }
-
-    result.modified = result.branches_removed > 0 || result.commits_removed > 0 || result.merges_removed > 0;
-
-    (new_forest, result)
-}
-
-/// Determine which branches to keep based on config
-fn identify_branches_to_keep(forest: &Forest, config: &PruneConfig) -> HashSet<String> {
-    let mut keep: HashSet<String> = HashSet::new();
+/// Prune the forest by removing dead branches (branches with no recent commits)
+/// and stubs (very short branches that don't add visual value).
+/// Returns a new Forest with the pruned trees.
+pub fn prune_forest(forest: &Forest, min_commits: usize, max_age_days: Option<u64>) -> Forest {
+    let mut pruned_trees: Vec<Tree> = Vec::new();
+    let mut pruned_commit_map: HashMap<String, CommitNode> = HashMap::new();
+    let mut pruned_merge_nodes: Vec<MergeNode> = Vec::new();
 
     for tree in &forest.trees {
-        let mut should_keep = true;
-
-        // Check minimum commits
-        if config.min_commits > 0 && tree.commits.len() < config.min_commits {
-            should_keep = false;
-        }
-
-        // Check max tip age (if age info available in commits)
-        if should_keep && config.max_tip_age_days > 0 {
-            if let Some(tip_commit) = tree.commits.last() {
-                if let Some(timestamp) = forest.commit_map.get(&tip_commit.id).and_then(|c| c.timestamp) {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    let age_seconds = now.saturating_sub(timestamp);
-                    let age_days = age_seconds / 86400;
-                    if age_days > config.max_tip_age_days {
-                        should_keep = false;
-                    }
+        let branch_id = &tree.branch_id;
+        let commits_on_branch: Vec<&String> = forest.commit_map.keys()
+            .filter(|id| {
+                if let Some(node) = forest.commit_map.get(*id) {
+                    node.branch_id == *branch_id
+                } else {
+                    false
                 }
-            }
-        }
+            })
+            .collect();
 
-        if should_keep {
-            keep.insert(tree.branch_name.clone());
-        }
-    }
-
-    keep
-}
-
-/// Collect all commit IDs that should be kept (from kept branches and their ancestors)
-fn collect_commits_to_keep(forest: &Forest, branches_to_keep: &HashSet<String>) -> HashSet<String> {
-    let mut keep: HashSet<String> = HashSet::new();
-
-    for tree in &forest.trees {
-        if !branches_to_keep.contains(&tree.branch_name) {
+        // Check minimum commit count
+        if commits_on_branch.len() < min_commits {
             continue;
         }
-        for commit in &tree.commits {
-            keep.insert(commit.id.clone());
-        }
-    }
 
-    // Also include parents of kept commits (ancestors)
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let current_keep = keep.clone();
-        for id in &current_keep {
-            if let Some(commit) = forest.commit_map.get(id) {
-                for parent in &commit.parents {
-                    if !keep.contains(parent) {
-                        keep.insert(parent.clone());
-                        changed = true;
-                    }
+        // Optionally check max age (if any commit is too old, prune the whole branch?)
+        // For simplicity, we keep the branch if at least one commit is recent enough.
+        if let Some(max_age) = max_age_days {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let max_age_secs = max_age * 86400;
+            let has_recent = commits_on_branch.iter().any(|id| {
+                if let Some(node) = forest.commit_map.get(*id) {
+                    (now - node.timestamp) < max_age_secs
+                } else {
+                    false
                 }
+            });
+            if !has_recent {
+                continue;
+            }
+        }
+
+        // Keep the tree
+        pruned_trees.push(tree.clone());
+        for id in &commits_on_branch {
+            if let Some(node) = forest.commit_map.get(*id) {
+                pruned_commit_map.insert(id.clone(), node.clone());
             }
         }
     }
 
-    keep
+    // Also keep merge nodes that reference surviving commits
+    for merge in &forest.merge_nodes {
+        let parent_survives = merge.parent_ids.iter().any(|pid| pruned_commit_map.contains_key(pid));
+        let child_survives = pruned_commit_map.contains_key(&merge.child_id);
+        if parent_survives || child_survives {
+            pruned_merge_nodes.push(merge.clone());
+        }
+    }
+
+    Forest {
+        trees: pruned_trees,
+        commit_map: pruned_commit_map,
+        merge_nodes: pruned_merge_nodes,
+    }
 }
 
-/// Reattach orphaned commits (commits that lost their branch but are still kept)
-/// to the nearest alive ancestor branch.
-fn reattach_orphaned_commits(
-    forest: &Forest,
-    commits_to_keep: &HashSet<String>,
-    layout: &LayoutResult,
-) -> Forest {
-    let mut new_forest = forest.clone();
-
-    // Find commits that are in commit_map but not in any tree
-    let mut orphaned: Vec<String> = Vec::new();
-    let mut all_tree_commits: HashSet<String> = HashSet::new();
-    for tree in &new_forest.trees {
-        for commit in &tree.commits {
-            all_tree_commits.insert(commit.id.clone());
+/// Remove stub branches (branches with very few commits and no merges).
+pub fn remove_stubs(forest: &Forest, min_commits: usize) -> Forest {
+    let mut pruned = forest.clone();
+    loop {
+        let before = pruned.trees.len();
+        pruned = prune_forest(&pruned, min_commits, None);
+        if pruned.trees.len() == before {
+            break;
         }
     }
-    for id in commits_to_keep {
-        if !all_tree_commits.contains(id) {
-            orphaned.push(id.clone());
+    pruned
+}
+
+/// Clean up orphaned commits (commits referenced by no tree and no merge node).
+pub fn remove_orphans(forest: &Forest) -> Forest {
+    let mut referenced: HashSet<String> = HashSet::new();
+    for tree in &forest.trees {
+        // We assume tree has a root_commit_id
+        // For now, we add all commits from commit_map that belong to this tree
+        for (id, node) in &forest.commit_map {
+            if node.branch_id == tree.branch_id {
+                referenced.insert(id.clone());
+            }
         }
     }
-
-    if orphaned.is_empty() {
-        return new_forest;
+    for merge in &forest.merge_nodes {
+        referenced.insert(merge.child_id.clone());
+        for pid in &merge.parent_ids {
+            referenced.insert(pid.clone());
+        }
     }
+    let mut pruned_commit_map: HashMap<String, CommitNode> = HashMap::new();
+    for (id, node) in &forest.commit_map {
+        if referenced.contains(id) {
+            pruned_commit_map.insert(id.clone(), node.clone());
+        }
+    }
+    Forest {
+        trees: forest.trees.clone(),
+        commit_map: pruned_commit_map,
+        merge_nodes: forest.merge_nodes.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prune_forest_removes_short_branches() {
+        let mut forest = Forest::default();
+        // Add a tree with 1 commit (should be pruned if min_commits=2)
+        let tree1 = Tree {
+            branch_id: "branch1".to_string(),
+            trunk_length: 1.0,
+            branch_points: vec![],
+            leaf_density: 0.5,
+        };
+        let commit1 = CommitNode {
+            id: "abc123".to_string(),
+            branch_id: "branch1".to_string(),
+            author: "author1".to_string(),
+            message: "first commit".to_string(),
+            timestamp: 1000,
+            parent_ids: vec![],
+            child_ids: vec![],
+        };
+        forest.trees.push(tree1);
+        forest.commit_map.insert("abc123".to_string(), commit1);
+
+        let pruned = prune_forest(&forest, 2, None);
+        assert!(pruned.trees.is_empty());
+        assert!(pruned.commit_map.is_empty());
+    }
+
+    #[test]
+    fn test_remove_orphans() {
+        let mut forest = Forest::default();
+        let tree = Tree {
+            branch_id: "main".to_string(),
+            trunk_length: 5.0,
+            branch_points: vec![],
+            leaf_density: 0.8,
+        };
+        forest.trees.push(tree);
+        let commit_main = CommitNode {
+            id: "main1".to_string(),
+            branch_id: "main".to_string(),
+            author: "author".to_string(),
+            message: "main commit".to_string(),
+            timestamp: 100,
+            parent_ids: vec![],
+            child_ids: vec![],
+        };
+        let orphan_commit = CommitNode {
+            id: "orphan".to_string(),
+            branch_id: "nonexistent".to_string(),
+            author: "orphan".to_string(),
+            message: "orphan".to_string(),
+            timestamp: 200,
+            parent_ids: vec![],
+            child_ids: vec![],
+        };
+        forest.commit_map.insert("main1".to_string(), commit_main);
+        forest.commit_map.insert("orphan".to_string(), orphan_commit);
+
+        let cleaned = remove_orphans(&forest);
+        assert!(cleaned.commit_map.contains_key("main1"));
+        assert!(!cleaned.commit_map.contains_key("orphan"));
+    }
+}
