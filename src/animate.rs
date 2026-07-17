@@ -38,125 +38,157 @@ impl Default for AnimationState {
 /// Trees grow from bottom to top, leaves change color with seasons.
 pub fn render_animated_frame(
     forest: &Forest,
+    author_colors: &std::collections::HashMap<String, (u8, u8, u8)>,
+    anim: &AnimationState,
     layout: &LayoutResult,
-    state: &mut AnimationState,
-    width: u16,
-    height: u16,
-    delta: f64,
 ) -> String {
-    state.sway_time += delta;
     let mut output = String::new();
     output.push_str(&format!("{}{}", termion::clear::All, termion::cursor::Goto(1, 1)));
-
-    // background
-    let (bg_r, bg_g, bg_b) = match state.season {
-        0 => (135, 206, 235), // spring: sky blue
-        1 => (100, 180, 255), // summer: deeper blue
-        2 => (200, 180, 100), // autumn: golden
-        3 => (220, 220, 255), // winter: pale
-        _ => (135, 206, 235),
+    
+    // Title bar
+    output.push_str(&format!(
+        "{}╔══════════════════════ GIT FOREST ══════════════════════╗{}\r\
+",
+        color::Fg(color::Rgb(100, 200, 100)),
+        color::Fg(color::Reset)
+    ));
+    
+    // Season indicator
+    let season_name = match anim.season {
+        0 => "Spring 🌸",
+        1 => "Summer ☀️",
+        2 => "Autumn 🍂",
+        3 => "Winter ❄️",
+        _ => "Unknown",
     };
-    for y in 0..height {
-        for x in 0..width {
-            output.push_str(&format!(
-                "{}{} ",
-                color::Bg(color::Rgb(bg_r, bg_g, bg_b)),
-                color::Fg(color::Reset)
-            ));
-        }
-        if y < height - 1 {
+    output.push_str(&format!(
+        "{}Season: {} | Growth: {:.0}%{}  \r\
+",
+        color::Fg(color::Rgb(255, 200, 100)),
+        season_name,
+        anim.growth * 100.0,
+        color::Fg(color::Reset)
+    ));
+    
+    // Draw each tree
+    for (i, tree) in forest.trees.iter().enumerate() {
+        let tree_lines = render_tree_with_growth(tree, anim, layout, i, author_colors);
+        for line in &tree_lines {
+            output.push_str(line);
             output.push_str("\r\
 ");
         }
     }
-    output.push_str(&format!("{} ", color::Bg(color::Reset)));
-
-    // Ensure sway amplitudes allocated
-    let tree_count = forest.trees.len();
-    if state.sway_amplitudes.len() != tree_count {
-        state.sway_amplitudes = vec![0.0; tree_count];
-        for i in 0..tree_count {
-            state.sway_amplitudes[i] = 0.5 + (i as f64 * 0.3).fract(); // pseudo-random
+    
+    // Draw merge root systems
+    for merge in &forest.merges {
+        let merge_lines = render_merge_with_growth(merge, anim, layout);
+        for line in &merge_lines {
+            output.push_str(line);
+            output.push_str("\r\
+");
         }
     }
+    
+    // Legend
+    output.push_str(&format!(
+        "{}\r\
+{}Controls: ↑↓ scroll | +/- zoom | q quit | i inspect | a toggle animation{}\r\
+",
+        "─".repeat(60),
+        color::Fg(color::Rgb(150, 150, 150)),
+        color::Fg(color::Reset)
+    ));
+    
+    output
+}
 
-    // Draw trees with sway
-    for (tree_idx, tree) in forest.trees.iter().enumerate() {
-        let sway_offset = (state.sway_time * 1.5 + state.sway_amplitudes[tree_idx] * 6.28).sin()
-            * state.sway_amplitudes[tree_idx]
-            * 2.0;
-        let base_x = tree.x as f64 + sway_offset;
-        let base_y = tree.y as f64;
-        let trunk_height = (tree.branches.len() as f64) * 2.0;
-        let visible_height = trunk_height * state.growth;
-        let start_y = base_y.floor() as u16;
-        let end_y = (base_y - visible_height).max(0.0).floor() as u16;
-
-        // Draw trunk
-        let trunk_char = '║';
-        for y in end_y..start_y {
-            if y < height {
-                let x_pos = (base_x.round() as u16).min(width.saturating_sub(1));
-                let (trunk_r, trunk_g, trunk_b) = (101, 67, 33); // brown
-                output.push_str(&format!(
-                    "{}{}{}",
-                    termion::cursor::Goto(x_pos + 1, y + 1),
-                    color::Fg(color::Rgb(trunk_r, trunk_g, trunk_b)),
-                    trunk_char
-                ));
-            }
-        }
-
-        // Draw branches with sway
-        for (branch_idx, branch) in tree.branches.iter().enumerate() {
-            let branch_sway = (state.sway_time * 2.0 + branch_idx as f64 * 0.7).sin()
-                * state.sway_amplitudes[tree_idx]
-                * 1.5;
-            let branch_x = base_x + branch.offset_x as f64 + branch_sway;
-            let branch_y = base_y - (branch_idx as f64) * 2.0 - 1.0;
-            if branch_y >= 0.0 && branch_y < height as f64 {
-                let x_pos = (branch_x.round() as u16).min(width.saturating_sub(1));
-                let y_pos = branch_y as u16;
-                let branch_char = match branch.direction {
-                    crate::BranchDirection::Left => '/',
-                    crate::BranchDirection::Right => '\\',
-                    crate::BranchDirection::Straight => '|',
-                };
-                let (branch_r, branch_g, branch_b) = (139, 90, 43);
-                output.push_str(&format!(
-                    "{}{}{}",
-                    termion::cursor::Goto(x_pos + 1, y_pos + 1),
-                    color::Fg(color::Rgb(branch_r, branch_g, branch_b)),
-                    branch_char
-                ));
-            }
-        }
-
-        // Draw leaves with season color and leaf density
-        let leaf_color = match state.season {
-            0 => (34, 139, 34),   // spring green
-            1 => (0, 200, 0),     // summer green
-            2 => (255, 140, 0),   // autumn orange
-            3 => (200, 200, 200), // winter gray
-            _ => (34, 139, 34),
+/// Render a single tree with growth animation: trunks grow upward, leaves appear gradually.
+fn render_tree_with_growth(
+    tree: &Tree,
+    anim: &AnimationState,
+    layout: &LayoutResult,
+    tree_index: usize,
+    author_colors: &std::collections::HashMap<String, (u8, u8, u8)>,
+) -> Vec<String> {
+    // Determine how many lines of trunk to show based on growth
+    let total_trunk_height = tree.trunk_height as f64;
+    let visible_height = (total_trunk_height * anim.growth).ceil() as usize;
+    
+    // Sway offset for this tree
+    let sway_amp = if tree_index < anim.sway_amplitudes.len() {
+        anim.sway_amplitudes[tree_index]
+    } else {
+        0.0
+    };
+    let sway = (anim.sway_time * 2.0).sin() * sway_amp;
+    
+    // Determine color based on author
+    let author_color = tree.commits.first()
+        .and_then(|c| author_colors.get(&c.author))
+        .copied()
+        .unwrap_or((100, 180, 100));
+    
+    let mut lines = Vec::new();
+    
+    // Trunk (bottom to top)
+    for y in 0..visible_height.min(tree.trunk_lines.len()) {
+        let raw_line = &tree.trunk_lines[y];
+        // Apply sway to trunk: shift characters horizontally
+        let shift = (sway * (1.0 - (y as f64 / total_trunk_height))).round() as i32;
+        let shifted_line = apply_horizontal_shift(raw_line, shift);
+        
+        // Color the trunk
+        let colored = format!(
+            "{}{}{}",
+            color::Fg(color::Rgb(author_color.0, author_color.1, author_color.2)),
+            shifted_line,
+            color::Fg(color::Reset)
+        );
+        lines.push(colored);
+    }
+    
+    // Leaves (topmost part, only appear after growth > 0.7)
+    if anim.growth > 0.7 && !tree.leaf_lines.is_empty() {
+        let leaf_alpha = ((anim.growth - 0.7) / 0.3).min(1.0);
+        let leaf_count = (tree.leaf_lines.len() as f64 * leaf_alpha).ceil() as usize;
+        
+        // Season-based leaf color
+        let leaf_color = match anim.season {
+            0 => (120, 255, 120), // spring green
+            1 => (50, 200, 50),   // summer green
+            2 => (255, 160, 50),  // autumn orange
+            3 => (200, 200, 220), // winter pale
+            _ => (100, 255, 100),
         };
-        let leaf_density = (tree.commit_count as f64 / 50.0).min(1.0) * state.growth;
-        let leaf_count = (leaf_density * 20.0) as u16;
-        for i in 0..leaf_count {
-            let leaf_angle = (state.sway_time * 3.0 + i as f64 * 1.1) * 0.3;
-            let leaf_radius = 2.0 + (i as f64 * 0.5).fract() * 3.0;
-            let leaf_x = base_x + leaf_angle.cos() * leaf_radius;
-            let leaf_y = base_y - trunk_height * state.growth - 2.0 + leaf_angle.sin() * leaf_radius;
-            if leaf_y >= 0.0 && leaf_y < height as f64 && leaf_x >= 0.0 && leaf_x < width as f64 {
-                let x_pos = leaf_x as u16;
-                let y_pos = leaf_y as u16;
-                let leaf_char = if state.season == 3 { '.' } else { '*' };
-                output.push_str(&format!(
-                    "{}{}{}",
-                    termion::cursor::Goto(x_pos + 1, y_pos + 1),
-                    color::Fg(color::Rgb(leaf_color.0, leaf_color.1, leaf_color.2)),
-                    leaf_char
-                ));
-            }
+        
+        for y in 0..leaf_count.min(tree.leaf_lines.len()) {
+            let raw_line = &tree.leaf_lines[y];
+            let shift = (sway * 0.3 * (1.0 - (y as f64 / tree.leaf_lines.len() as f64))).round() as i32;
+            let shifted_line = apply_horizontal_shift(raw_line, shift);
+            
+            let colored = format!(
+                "{}{}{}",
+                color::Fg(color::Rgb(leaf_color.0, leaf_color.1, leaf_color.2)),
+                shifted_line,
+                color::Fg(color::Reset)
+            );
+            lines.push(colored);
         }
+    }
+    
+    lines
+}
+
+/// Render merge nodes as root systems with growth animation.
+fn render_merge_with_growth(
+    merge: &MergeNode,
+    anim: &AnimationState,
+    layout: &LayoutResult,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    
+    // Merge roots appear once growth > 0.3
+    if anim.growth <= 0.3 {
+        return lines;
     }
