@@ -38,148 +38,154 @@ pub fn find_commit_at_position(
     screen_x: u16,
     screen_y: u16,
     view: &InteractiveView,
+    author_colors: &HashMap<String, (u8, u8, u8)>,
 ) -> Option<CommitNode> {
-    let (term_w, term_h) = termion::terminal_size().ok()?;
-    // Convert screen coordinates to world coordinates
-    let world_x = (screen_x as f64 - term_w as f64 / 2.0) / view.zoom + view.offset_x;
-    let world_y = (screen_y as f64 - term_h as f64 / 2.0) / view.zoom + view.offset_y;
+    let world_x = (screen_x as f64 - view.offset_x) / view.zoom;
+    let world_y = (screen_y as f64 - view.offset_y) / view.zoom;
 
-    // Search through all commits for the closest one within a radius
-    let threshold = 3.0 / view.zoom; // click radius in world units
-    let mut closest: Option<(f64, CommitNode)> = None;
-
-    for tree in &forest.trees {
-        for commit_id in &tree.commits {
-            if let Some(pos) = forest.positions.get(commit_id) {
-                let dx = pos.0 - world_x;
-                let dy = pos.1 - world_y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                if dist < threshold {
-                    match &closest {
-                        Some((best_dist, _)) if dist < *best_dist => {
-                            if let Some(node) = forest.commit_map.get(commit_id) {
-                                closest = Some((dist, node.clone()));
-                            }
-                        }
-                        None => {
-                            if let Some(node) = forest.commit_map.get(commit_id) {
-                                closest = Some((dist, node.clone()));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+    for (_, commit) in &forest.commit_map {
+        let dx = commit.x - world_x;
+        let dy = commit.y - world_y;
+        let dist = (dx * dx + dy * dy).sqrt();
+        // Click radius of 3 in world coordinates
+        if dist < 3.0 {
+            return Some(commit.clone());
         }
     }
-
-    closest.map(|(_, node)| node)
+    None
 }
 
-/// Run the interactive viewer: handles keyboard input and renders the forest.
-/// Returns when the user presses 'q' or Ctrl-C.
-pub fn run_interactive(forest: &Forest) -> Result<(), Box<dyn std::error::Error>> {
-    let mut view = InteractiveView::default();
-    let mut stdout = stdout().into_raw_mode()?;
+/// Run the interactive loop until user quits
+pub fn run_interactive(
+    forest: &Forest,
+    author_colors: &HashMap<String, (u8, u8, u8)>,
+) -> io::Result<()> {
+    let stdout = stdout();
+    let mut stdout = stdout.lock().into_raw_mode()?;
     let stdin = stdin();
+    let mut keys = stdin.keys();
 
-    // Initial render
-    render_interactive_frame(&mut stdout, forest, &view)?;
+    let mut view = InteractiveView::default();
 
-    // Handle input
-    for c in stdin.keys() {
-        match c? {
-            Key::Char('q') | Key::Ctrl('c') => break,
-            Key::Left => {
-                view.offset_x -= 0.1 / view.zoom;
-                render_interactive_frame(&mut stdout, forest, &view)?;
+    write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
+    render_forest_interactive(&mut stdout, forest, &view, author_colors)?;
+    stdout.flush()?;
+
+    loop {
+        if let Some(key) = keys.next() {
+            match key? {
+                Key::Char('q') => break,
+                Key::Left => view.offset_x -= 5.0,
+                Key::Right => view.offset_x += 5.0,
+                Key::Up => view.offset_y -= 5.0,
+                Key::Down => view.offset_y += 5.0,
+                Key::Char('+') | Key::Char('=') => view.zoom *= 1.1,
+                Key::Char('-') | Key::Char('_') => view.zoom /= 1.1,
+                Key::Char('i') => view.info_visible = !view.info_visible,
+                Key::Esc => break,
+                _ => {}
             }
-            Key::Right => {
-                view.offset_x += 0.1 / view.zoom;
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Up => {
-                view.offset_y -= 0.1 / view.zoom;
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Down => {
-                view.offset_y += 0.1 / view.zoom;
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Char('+') | Key::Char('=') => {
-                view.zoom *= 1.2;
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Char('-') | Key::Char('_') => {
-                view.zoom /= 1.2;
-                if view.zoom < 0.1 {
-                    view.zoom = 0.1;
-                }
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Char('i') => {
-                view.info_visible = !view.info_visible;
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            Key::Char(' ') => {
-                // Toggle selection (could be used for clicking)
-                // For now, select the first commit of the first tree as a demo
-                if let Some(tree) = forest.trees.first() {
-                    if let Some(first_id) = tree.commits.first() {
-                        if let Some(node) = forest.commit_map.get(first_id) {
-                            view.selected_commit = Some(node.clone());
-                            view.selected_tree = Some(tree.name.clone());
-                        }
-                    }
-                }
-                render_interactive_frame(&mut stdout, forest, &view)?;
-            }
-            _ => {}
+
+            write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
+            render_forest_interactive(&mut stdout, forest, &view, author_colors)?;
+            stdout.flush()?;
         }
     }
 
-    // Reset terminal
-    write!(stdout, "{}{}{}", clear::All, cursor::Show, cursor::Goto(1, 1))?;
+    write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
+    writeln!(stdout, "Exited interactive mode.")?;
     stdout.flush()?;
     Ok(())
 }
 
-/// Render the current interactive frame to the terminal.
-fn render_interactive_frame(
-    stdout: &mut dyn Write,
+/// Render the forest to the terminal with current view state
+fn render_forest_interactive<W: Write>(
+    w: &mut W,
     forest: &Forest,
     view: &InteractiveView,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (term_w, term_h) = termion::terminal_size()?;
+    author_colors: &HashMap<String, (u8, u8, u8)>,
+) -> io::Result<()> {
+    // Determine terminal size (approximate)
+    let term_width = 80;
+    let term_height = 24;
 
-    // Clear screen and hide cursor
-    write!(stdout, "{}{}{}", clear::All, cursor::Goto(1, 1), cursor::Hide)?;
+    // Draw trees
+    for (tree_id, tree) in &forest.trees {
+        let trunk_x = tree.trunk_x * view.zoom + view.offset_x;
+        let trunk_y = tree.trunk_y * view.zoom + view.offset_y;
 
-    // Draw forest elements
-    for tree in &forest.trees {
-        // Draw trunk (vertical line)
-        if let Some(root_pos) = forest.positions.get(&tree.root) {
-            let screen_x = ((root_pos.0 - view.offset_x) * view.zoom + term_w as f64 / 2.0) as u16;
-            let screen_y = ((root_pos.1 - view.offset_y) * view.zoom + term_h as f64 / 2.0) as u16;
-            if screen_x > 0 && screen_x <= term_w && screen_y > 0 && screen_y <= term_h {
-                write!(stdout, "{}", cursor::Goto(screen_x, screen_y))?;
-                // Use a tree symbol
-                if view.selected_tree.as_deref() == Some(&tree.name) {
-                    write!(stdout, "{}♥{}", color::Fg(color::Red), color::Fg(color::Reset))?;
-                } else {
-                    write!(stdout, "♣")?;
-                }
+        // Draw trunk as vertical line
+        for i in 0..tree.height as usize {
+            let screen_x = trunk_x as u16;
+            let screen_y = (trunk_y - i as f64 * view.zoom) as u16;
+            if screen_x < term_width && screen_y < term_height {
+                // Color by author of first commit in tree
+                let author = &tree.commits.first().map(|c| c.author.clone()).unwrap_or_default();
+                let color = author_colors.get(author).copied().unwrap_or((100, 180, 100));
+                write!(
+                    w,
+                    "{}{}{}█{}",
+                    cursor::Goto(screen_x + 1, screen_y + 1),
+                    color::Fg(color::Rgb(color.0, color.1, color.2)),
+                    color::Bg(color::Rgb(20, 40, 20)),
+                    color::Fg(color::Reset)
+                )?;
             }
         }
 
-        // Draw leaves for each commit
-        for commit_id in &tree.commits {
-            if let Some(pos) = forest.positions.get(commit_id) {
-                let screen_x = ((pos.0 - view.offset_x) * view.zoom + term_w as f64 / 2.0) as u16;
-                let screen_y = ((pos.1 - view.offset_y) * view.zoom + term_h as f64 / 2.0) as u16;
-                if screen_x > 0 && screen_x <= term_w && screen_y > 0 && screen_y <= term_h {
-                    write!(stdout, "{}", cursor::Goto(screen_x, screen_y))?;
-                    if let Some(node) = forest.commit_map.get(commit_id) {
-                        // Color by author if available
-                        if let Some(color) = forest.author_colors.get(&node.author) {
-                            write!(stdout, "{}·{}
+        // Draw leaves (commits) as colored dots along the trunk
+        for (i, commit) in tree.commits.iter().enumerate() {
+            let leaf_y = (trunk_y - i as f64 * view.zoom) as u16;
+            let leaf_x = trunk_x as u16;
+            if leaf_x < term_width && leaf_y < term_height {
+                let color = author_colors.get(&commit.author).copied().unwrap_or((200, 200, 100));
+                let symbol = if view.selected_commit.as_ref().map(|c| c.id == commit.id).unwrap_or(false) {
+                    "*"
+                } else {
+                    "•"
+                };
+                write!(
+                    w,
+                    "{}{}{}{}{}",
+                    cursor::Goto(leaf_x + 1, leaf_y + 1),
+                    color::Fg(color::Rgb(color.0, color.1, color.2)),
+                    color::Bg(color::Rgb(10, 30, 10)),
+                    symbol,
+                    color::Fg(color::Reset)
+                )?;
+            }
+        }
+    }
+
+    // Draw merge roots
+    for (_, merge) in &forest.merges {
+        let mx = merge.x * view.zoom + view.offset_x;
+        let my = merge.y * view.zoom + view.offset_y;
+        let mx_u = mx as u16;
+        let my_u = my as u16;
+        if mx_u < term_width && my_u < term_height {
+            write!(
+                w,
+                "{}{}⚡{}",
+                cursor::Goto(mx_u + 1, my_u + 1),
+                color::Fg(color::Rgb(255, 200, 50)),
+                color::Fg(color::Reset)
+            )?;
+        }
+    }
+
+    // Draw info panel if visible
+    if view.info_visible {
+        if let Some(commit) = &view.selected_commit {
+            let details = format_commit_details_interactive(commit, author_colors);
+            let lines: Vec<&str> = details.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if i < term_height as usize {
+                    write!(
+                        w,
+                        "{}{}",
+                        cursor::Goto(1, (term_height - 5 + i as u16).min(term_height)),
+                        line
+                    )?;
+                }
+            }
