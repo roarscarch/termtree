@@ -1,219 +1,172 @@
 use crate::{Forest, Tree, CommitNode, MergeNode};
 use std::collections::HashMap;
-use termion::color;
 
-/// Generate a structured summary report for the forest.
-pub fn generate_summary(forest: &Forest) -> String {
-    let mut report = String::new();
-
-    // Header
-    report.push_str(&format!(
-        "{}╔══════════════════════════════════════╗\r\
-",
-        color::Fg(color::Green)
-    ));
-    report.push_str(&format!(
-        "║      Git Forest Summary Report       ║\r\
-"
-    ));
-    report.push_str(&format!(
-        "╚══════════════════════════════════════╝{}\r\
-\r\
-",
-        color::Fg(color::Reset)
-    ));
-
-    // Basic stats
+/// Generate a structured summary report of the forest.
+pub fn generate_summary(forest: &Forest) -> SummaryReport {
     let total_commits = forest.commit_map.len();
     let total_trees = forest.trees.len();
-    let total_merges = forest.merges.len();
-    let total_authors = count_authors(forest);
-
-    report.push_str(&format!(
-        "{}Commits:{} {}\r\
-",
-        color::Fg(color::Cyan),
-        color::Fg(color::Reset),
-        total_commits
-    ));
-    report.push_str(&format!(
-        "{}Trees (branches):{} {}\r\
-",
-        color::Fg(color::Cyan),
-        color::Fg(color::Reset),
-        total_trees
-    ));
-    report.push_str(&format!(
-        "{}Merge nodes:{} {}\r\
-",
-        color::Fg(color::Cyan),
-        color::Fg(color::Reset),
-        total_merges
-    ));
-    report.push_str(&format!(
-        "{}Unique authors:{} {}\r\
-\r\
-",
-        color::Fg(color::Cyan),
-        color::Fg(color::Reset),
-        total_authors
-    ));
-
-    // Tree details
-    report.push_str(&format!(
-        "{}Tree Details:{}\r\
-",
-        color::Fg(color::Yellow),
-        color::Fg(color::Reset)
-    ));
-    report.push_str(&"─".repeat(40));
-    report.push_str("\r\
-");
-
-    let mut trees_sorted: Vec<&Tree> = forest.trees.values().collect();
-    trees_sorted.sort_by(|a, b| b.commits.len().cmp(&a.commits.len()));
-
-    for (i, tree) in trees_sorted.iter().enumerate() {
-        let commit_count = tree.commits.len();
-        let branch_name = tree.name.as_deref().unwrap_or("(unnamed)");
-        let author = tree.author.as_deref().unwrap_or("(unknown)");
-        report.push_str(&format!(
-            "  {}. {} ({} commits, author: {})\r\
-",
-            i + 1,
-            branch_name,
-            commit_count,
-            author
-        ));
+    let total_merges = forest.merge_nodes.len();
+    let total_authors = forest.commit_map.values().map(|c| &c.author).collect::<std::collections::HashSet<_>>().len();
+    let mut author_commit_counts: HashMap<String, usize> = HashMap::new();
+    for commit in forest.commit_map.values() {
+        *author_commit_counts.entry(commit.author.clone()).or_insert(0) += 1;
     }
+    let mut author_counts: Vec<(String, usize)> = author_commit_counts.into_iter().collect();
+    author_counts.sort_by(|a, b| b.1.cmp(&a.1));
 
-    report.push_str("\r\
-");
-
-    // Author breakdown
-    report.push_str(&format!(
-        "{}Author Breakdown:{}\r\
-",
-        color::Fg(color::Yellow),
-        color::Fg(color::Reset)
-    ));
-    report.push_str(&"─".repeat(40));
-    report.push_str("\r\
-");
-
-    let author_counts = count_author_commits(forest);
-    let mut authors_sorted: Vec<(&String, &usize)> = author_counts.iter().collect();
-    authors_sorted.sort_by(|a, b| b.1.cmp(a.1));
-
-    for (author, count) in &authors_sorted {
-        let bar = "█".repeat(*count.min(&40));
-        report.push_str(&format!(
-            "  {:20} {} {}\r\
-",
-            author,
-            bar,
-            count
-        ));
-    }
-
-    report.push_str("\r\
-");
-
-    // Merge storm info
-    if !forest.merge_storms.is_empty() {
-        report.push_str(&format!(
-            "{}Merge Storms:{} {}\r\
-",
-            color::Fg(color::Red),
-            color::Fg(color::Reset),
-            forest.merge_storms.len()
-        ));
-        for (i, storm) in forest.merge_storms.iter().enumerate() {
-            report.push_str(&format!(
-                "  {}. {} merges at {}\r\
-",
-                i + 1,
-                storm.merge_count,
-                storm.location
-            ));
+    let mut branch_lengths: Vec<usize> = forest.trees.iter().map(|t| t.nodes.len()).collect();
+    branch_lengths.sort();
+    let median_branch_length = if branch_lengths.is_empty() {
+        0
+    } else {
+        let mid = branch_lengths.len() / 2;
+        if branch_lengths.len() % 2 == 0 {
+            (branch_lengths[mid - 1] + branch_lengths[mid]) / 2
+        } else {
+            branch_lengths[mid]
         }
-        report.push_str("\r\
-");
+    };
+    let max_branch_length = branch_lengths.last().copied().unwrap_or(0);
+    let min_branch_length = branch_lengths.first().copied().unwrap_or(0);
+
+    // Count merge storms (simultaneous merges within a small time window)
+    let mut merge_storms = 0;
+    let mut merge_timestamps: Vec<u64> = forest.merge_nodes.iter().filter_map(|m| m.timestamp).collect();
+    merge_timestamps.sort();
+    let storm_window = 3600; // 1 hour in seconds
+    let mut i = 0;
+    while i < merge_timestamps.len() {
+        let window_start = merge_timestamps[i];
+        let mut count = 0;
+        while i < merge_timestamps.len() && merge_timestamps[i] <= window_start + storm_window {
+            count += 1;
+            i += 1;
+        }
+        if count >= 3 {
+            merge_storms += 1;
+        }
     }
 
-    // Footer
-    report.push_str(&format!(
-        "{}Generated by git-forest{}\r\
-",
-        color::Fg(color::Green),
-        color::Fg(color::Reset)
-    ));
-
-    report
+    SummaryReport {
+        total_commits,
+        total_trees,
+        total_merges,
+        total_authors,
+        author_counts,
+        median_branch_length,
+        max_branch_length,
+        min_branch_length,
+        merge_storms,
+    }
 }
 
-/// Count unique authors in the forest.
-fn count_authors(forest: &Forest) -> usize {
-    let mut authors = std::collections::HashSet::new();
-    for commit in forest.commit_map.values() {
-        authors.insert(commit.author.clone());
-    }
-    authors.len()
+#[derive(Debug, Clone)]
+pub struct SummaryReport {
+    pub total_commits: usize,
+    pub total_trees: usize,
+    pub total_merges: usize,
+    pub total_authors: usize,
+    pub author_counts: Vec<(String, usize)>,
+    pub median_branch_length: usize,
+    pub max_branch_length: usize,
+    pub min_branch_length: usize,
+    pub merge_storms: usize,
 }
 
-/// Count commits per author.
-fn count_author_commits(forest: &Forest) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    for commit in forest.commit_map.values() {
-        *counts.entry(commit.author.clone()).or_insert(0) += 1;
+impl std::fmt::Display for SummaryReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Forest Summary")?;
+        writeln!(f, "{}", "─".repeat(40))?;
+        writeln!(f, "Total commits: {}", self.total_commits)?;
+        writeln!(f, "Total trees (branches): {}", self.total_trees)?;
+        writeln!(f, "Total merges: {}", self.total_merges)?;
+        writeln!(f, "Total authors: {}", self.total_authors)?;
+        writeln!(f, "Branch lengths (min/median/max): {}/{}/{}", self.min_branch_length, self.median_branch_length, self.max_branch_length)?;
+        writeln!(f, "Merge storms: {}", self.merge_storms)?;
+        writeln!(f, "\nAuthor contribution:")?;
+        for (author, count) in &self.author_counts {
+            let bar = "█".repeat((*count as f64 / self.total_commits as f64 * 40.0) as usize);
+            writeln!(f, "  {:20} {:5} {}", author, count, bar)?;
+        }
+        Ok(())
     }
-    counts
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Forest, Tree, CommitNode, MergeNode, MergeStorm};
+    use crate::{Forest, Tree, CommitNode, MergeNode};
 
-    fn create_test_forest() -> Forest {
-        let mut forest = Forest {
-            trees: std::collections::HashMap::new(),
+    #[test]
+    fn test_summary_empty_forest() {
+        let forest = Forest {
+            trees: vec![],
             commit_map: std::collections::HashMap::new(),
-            merges: Vec::new(),
-            merge_storms: Vec::new(),
+            merge_nodes: vec![],
+            layout: None,
         };
+        let report = generate_summary(&forest);
+        assert_eq!(report.total_commits, 0);
+        assert_eq!(report.total_trees, 0);
+        assert_eq!(report.total_merges, 0);
+        assert_eq!(report.total_authors, 0);
+        assert_eq!(report.median_branch_length, 0);
+        assert_eq!(report.max_branch_length, 0);
+        assert_eq!(report.min_branch_length, 0);
+        assert_eq!(report.merge_storms, 0);
+    }
 
-        // Add a tree
-        let mut tree = Tree {
-            id: "main".to_string(),
-            name: Some("main".to_string()),
-            author: Some("Alice".to_string()),
-            commits: Vec::new(),
-            root: None,
-            children: Vec::new(),
-            parent: None,
-            trunk: Vec::new(),
-            branches: Vec::new(),
-            color: (100, 200, 50),
+    #[test]
+    fn test_summary_with_data() {
+        let mut commit_map = std::collections::HashMap::new();
+        commit_map.insert("a".to_string(), CommitNode {
+            id: "a".to_string(),
+            author: "alice".to_string(),
+            timestamp: Some(1000),
+            message: "first".to_string(),
+            parents: vec![],
+            children: vec!["b".to_string()],
             x: 0.0,
             y: 0.0,
-            width: 10.0,
-            height: 20.0,
+        });
+        commit_map.insert("b".to_string(), CommitNode {
+            id: "b".to_string(),
+            author: "bob".to_string(),
+            timestamp: Some(2000),
+            message: "second".to_string(),
+            parents: vec!["a".to_string()],
+            children: vec![],
+            x: 0.0,
+            y: 1.0,
+        });
+        let tree = Tree {
+            id: "main".to_string(),
+            nodes: vec!["a".to_string(), "b".to_string()],
+            color: (100, 150, 200),
+            trunk_width: 1.0,
         };
-        for i in 0..10 {
-            let commit_id = format!("abc{}", i);
-            let commit = CommitNode {
-                id: commit_id.clone(),
-                author: "Alice".to_string(),
-                message: format!("commit {}", i),
-                timestamp: 1000 + i as u64,
-                parents: if i == 0 { Vec::new() } else { vec![format!("abc{}", i-1)] },
-                children: Vec::new(),
-                is_merge: false,
-                x: 0.0,
-                y: i as f64 * 2.0,
-                branch: "main".to_string(),
-            };
-            tree.commits.push(commit_id.clone());
-            forest.commit_map.insert(commit_id, commit);
-        }
+        let merge_node = MergeNode {
+            id: "merge1".to_string(),
+            parents: vec!["a".to_string(), "b".to_string()],
+            children: vec![],
+            timestamp: Some(3000),
+            x: 0.5,
+            y: 0.5,
+        };
+        let forest = Forest {
+            trees: vec![tree],
+            commit_map,
+            merge_nodes: vec![merge_node],
+            layout: None,
+        };
+        let report = generate_summary(&forest);
+        assert_eq!(report.total_commits, 2);
+        assert_eq!(report.total_trees, 1);
+        assert_eq!(report.total_merges, 1);
+        assert_eq!(report.total_authors, 2);
+        assert_eq!(report.median_branch_length, 2);
+        assert_eq!(report.max_branch_length, 2);
+        assert_eq!(report.min_branch_length, 2);
+        assert_eq!(report.merge_storms, 0);
+    }
+}
