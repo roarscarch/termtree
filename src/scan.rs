@@ -1,144 +1,213 @@
-use crate::{CommitNode, Forest, Tree, MergeNode};
-use git2::{Repository, Oid, Sort};
+use git2::{Repository, Oid, SortMode};
+use crate::types::{Forest, CommitNode, MergeNode, Tree, BranchInfo};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-/// Scan a git repository and build a Forest data structure.
-pub fn scan_repository(path: &str) -> Result<Forest, String> {
-    let repo = Repository::open(path).map_err(|e| format!("Failed to open repository: {}", e))?;
-    let mut revwalk = repo.revwalk().map_err(|e| format!("Failed to create revwalk: {}", e))?;
-    revwalk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME).map_err(|e| format!("Failed to set sorting: {}", e))?;
-    revwalk.push_head().map_err(|e| format!("Failed to push HEAD: {}", e))?;
+/// Scan a git repository and extract the commit graph into a Forest structure.
+pub fn scan_repository<P: AsRef<Path>>(path: P) -> Result<Forest, Box<dyn std::error::Error>> {
+    let repo = Repository::open(path)?;
+    
+    let mut forest = Forest {
+        trees: Vec::new(),
+        commit_map: HashMap::new(),
+        merge_nodes: Vec::new(),
+        root_commits: Vec::new(),
+        branches: Vec::new(),
+        stats: Default::default(),
+    };
 
-    let mut commit_map: HashMap<String, CommitNode> = HashMap::new();
+    // Collect all references (branches)
+    let branches = collect_branches(&repo)?;
+    forest.branches = branches.clone();
+
+    // Walk all commits from all branch tips
+    let mut visited: HashSet<Oid> = HashSet::new();
+    let mut commit_list: Vec<CommitNode> = Vec::new();
+    let mut merge_list: Vec<MergeNode> = Vec::new();
     let mut parent_map: HashMap<String, Vec<String>> = HashMap::new();
     let mut child_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut branch_heads: HashMap<String, String> = HashMap::new(); // branch name -> commit id
 
-    // Collect all commits
-    for oid_result in revwalk {
-        let oid = oid_result.map_err(|e| format!("Revwalk error: {}", e))?;
-        let commit = repo.find_commit(oid).map_err(|e| format!("Failed to find commit: {}", e))?;
-        let id = oid.to_string();
-        let author = commit.author().name().unwrap_or("unknown").to_string();
-        let message = commit.message().unwrap_or("").to_string();
-        let time = commit.time().seconds() as u64;
-        let parent_ids: Vec<String> = commit.parents().map(|p| p.id().to_string()).collect();
-
-        let node = CommitNode {
-            id: id.clone(),
-            message,
-            author,
-            time,
-            parent_ids: parent_ids.clone(),
-            children: Vec::new(),
-        };
-        commit_map.insert(id.clone(), node);
-        parent_map.insert(id.clone(), parent_ids.clone());
-
-        for pid in &parent_ids {
-            child_map.entry(pid.clone()).or_insert_with(Vec::new).push(id.clone());
+    for branch in &branches {
+        let oid = Oid::from_str(&branch.target_oid)?;
+        if visited.contains(&oid) {
+            continue;
         }
-    }
+        let mut revwalk = repo.revwalk()?;
+        revwalk.push(oid)?;
+        revwalk.set_sorting(SortMode::TOPOLOGICAL | SortMode::TIME)?;
 
-    // Populate children in commit_map
-    for (child_id, parents) in &parent_map {
-        for pid in parents {
-            if let Some(parent_node) = commit_map.get_mut(pid) {
-                parent_node.children.push(child_id.clone());
-            }
-        }
-    }
-
-    // Identify branch heads (local branches)
-    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
-        for branch_result in branches {
-            if let Ok((branch, _)) = branch_result {
-                if let Some(name) = branch.name().ok().flatten() {
-                    if let Some(target) = branch.get().target() {
-                        branch_heads.insert(name.to_string(), target.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    // Build trees: each branch head becomes a tree root, but we merge branches that share history
-    let mut tree_roots: Vec<String> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-
-    // Start from branch heads and walk backwards, marking commits as belonging to that tree
-    for (branch_name, head_id) in &branch_heads {
-        if !visited.contains(head_id) {
-            tree_roots.push(head_id.clone());
-            // Mark all ancestors as visited for this tree
-            let mut stack = vec![head_id.clone()];
-            while let Some(current) = stack.pop() {
-                if visited.contains(&current) {
-                    continue;
-                }
-                visited.insert(current.clone());
-                if let Some(parents) = parent_map.get(&current) {
-                    for parent in parents {
-                        stack.push(parent.clone());
-                    }
-                }
-            }
-        }
-    }
-
-    // If no branches found, use HEAD
-    if tree_roots.is_empty() {
-        if let Ok(head) = repo.head() {
-            if let Some(target) = head.target() {
-                tree_roots.push(target.to_string());
-            }
-        }
-    }
-
-    // Build trees
-    let mut trees: Vec<Tree> = Vec::new();
-    for root_id in &tree_roots {
-        let mut commit_ids: Vec<String> = Vec::new();
-        let mut stack = vec![root_id.clone()];
-        let mut local_visited: HashSet<String> = HashSet::new();
-        while let Some(current) = stack.pop() {
-            if local_visited.contains(&current) {
+        for oid_result in revwalk {
+            let oid = oid_result?;
+            if visited.contains(&oid) {
                 continue;
             }
-            local_visited.insert(current.clone());
-            commit_ids.push(current.clone());
-            if let Some(parents) = parent_map.get(&current) {
-                for parent in parents {
-                    if !local_visited.contains(parent) {
-                        stack.push(parent.clone());
-                    }
+            visited.insert(oid);
+
+            let commit = repo.find_commit(oid)?;
+            let id = oid.to_string();
+            let author = commit.author().name().unwrap_or("unknown").to_string();
+            let time = commit.time().seconds();
+            let message = commit.message().unwrap_or("").to_string();
+
+            let parent_ids: Vec<String> = commit.parent_ids().map(|p| p.to_string()).collect();
+            parent_map.insert(id.clone(), parent_ids.clone());
+
+            for parent_id in &parent_ids {
+                child_map.entry(parent_id.clone()).or_default().push(id.clone());
+            }
+
+            let is_merge = parent_ids.len() > 1;
+            if is_merge {
+                merge_list.push(MergeNode {
+                    id: id.clone(),
+                    parents: parent_ids.clone(),
+                    time,
+                    author: author.clone(),
+                });
+            }
+
+            commit_list.push(CommitNode {
+                id: id.clone(),
+                author,
+                time,
+                message: message.lines().next().unwrap_or("").to_string(),
+                parent_ids: parent_ids.clone(),
+                is_merge,
+                children: Vec::new(),
+                branch_hint: branch.name.clone(),
+                tree_index: None,
+            });
+        }
+    }
+
+    // Build children lists
+    for commit in &mut commit_list {
+        if let Some(children) = child_map.get(&commit.id) {
+            commit.children = children.clone();
+        }
+    }
+
+    // Identify root commits (no parents)
+    for commit in &commit_list {
+        if commit.parent_ids.is_empty() {
+            forest.root_commits.push(commit.id.clone());
+        }
+    }
+
+    // Build commit map
+    for commit in commit_list.into_iter() {
+        forest.commit_map.insert(commit.id.clone(), commit);
+    }
+
+    forest.merge_nodes = merge_list;
+
+    // Build trees from branches
+    forest.trees = build_trees(&forest, &branches);
+
+    // Compute stats
+    forest.stats = crate::stats::compute_stats(&forest);
+
+    Ok(forest)
+}
+
+/// Collect all branches and their current tip OIDs.
+fn collect_branches(repo: &Repository) -> Result<Vec<BranchInfo>, Box<dyn std::error::Error>> {
+    let mut branches = Vec::new();
+    let branch_iter = repo.branches(Some(git2::BranchType::Local))?;
+
+    for branch_result in branch_iter {
+        let (branch, _type) = branch_result?;
+        let name = branch.name()?.unwrap_or("unknown").to_string();
+        if let Some(target) = branch.get().target() {
+            branches.push(BranchInfo {
+                name,
+                target_oid: target.to_string(),
+            });
+        }
+    }
+
+    // Also collect remote branches
+    let remote_branch_iter = repo.branches(Some(git2::BranchType::Remote))?;
+    for branch_result in remote_branch_iter {
+        let (branch, _type) = branch_result?;
+        let name = branch.name()?.unwrap_or("unknown").to_string();
+        if let Some(target) = branch.get().target() {
+            branches.push(BranchInfo {
+                name,
+                target_oid: target.to_string(),
+            });
+        }
+    }
+
+    Ok(branches)
+}
+
+/// Build tree structures from branch information and commit graph.
+fn build_trees(forest: &Forest, branches: &[BranchInfo]) -> Vec<Tree> {
+    let mut trees: Vec<Tree> = Vec::new();
+    let mut assigned_commits: HashSet<String> = HashSet::new();
+
+    for branch in branches {
+        let mut tree_commits: Vec<String> = Vec::new();
+        let mut current_oid = branch.target_oid.clone();
+
+        // Walk backwards from branch tip until we hit an already assigned commit or root
+        loop {
+            if assigned_commits.contains(&current_oid) {
+                break;
+            }
+            if let Some(commit) = forest.commit_map.get(&current_oid) {
+                tree_commits.push(current_oid.clone());
+                assigned_commits.insert(current_oid.clone());
+
+                if commit.parent_ids.is_empty() {
+                    break;
+                }
+                // Follow first parent (main line)
+                current_oid = commit.parent_ids[0].clone();
+            } else {
+                break;
+            }
+        }
+
+        if !tree_commits.is_empty() {
+            trees.push(Tree {
+                root: tree_commits.last().cloned().unwrap_or_default(),
+                trunk_commits: tree_commits.clone(),
+                branch_tip: branch.target_oid.clone(),
+                leaf_commits: Vec::new(),
+                color: (100, 180, 100), // default green, will be updated later
+                label: branch.name.clone(),
+                sway_offset: 0.0,
+            });
+        }
+    }
+
+    // Assign remaining unassigned commits to nearest tree
+    for (id, commit) in &forest.commit_map {
+        if !assigned_commits.contains(id) {
+            // Find closest tree by checking common ancestors
+            if let Some(tree_idx) = find_nearest_tree(forest, &trees, id) {
+                if let Some(tree) = trees.get_mut(tree_idx) {
+                    tree.leaf_commits.push(id.clone());
                 }
             }
         }
-        trees.push(Tree {
-            root: root_id.clone(),
-            commits: commit_ids,
-        });
     }
 
-    // Detect merge nodes (commits with more than one parent)
-    let mut merge_nodes: Vec<MergeNode> = Vec::new();
-    for (id, parents) in &parent_map {
-        if parents.len() > 1 {
-            if let Some(commit) = commit_map.get(id) {
-                merge_nodes.push(MergeNode {
-                    id: id.clone(),
-                    parent_ids: parents.clone(),
-                    child_ids: commit.children.clone(),
-                    timestamp: commit.time,
-                });
-            }
-        }
-    }
-
-    Ok(Forest {
-        commit_map,
-        trees,
-        merge_nodes,
-    })
+    trees
 }
+
+/// Find the tree that is most closely related to a given commit.
+fn find_nearest_tree(forest: &Forest, trees: &[Tree], commit_id: &str) -> Option<usize> {
+    let mut best_score = 0usize;
+    let mut best_idx = None;
+
+    for (idx, tree) in trees.iter().enumerate() {
+        let mut score = 0;
+        // Count ancestors in common
+        let mut current = commit_id.to_string();
+        loop {
+            if tree.trunk_commits.contains(&current) || tree.leaf_commits.contains(&current) {
+                score += 10;
+            }
