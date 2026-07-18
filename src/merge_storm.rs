@@ -1,124 +1,214 @@
-use crate::{Forest, Tree, MergeNode, CommitNode};
+use crate::{Forest, CommitNode, MergeNode};
 use std::collections::{HashMap, HashSet};
 
-/// Represents a detected merge storm: a cluster of simultaneous merges.
+/// Represents a detected merge storm — a period with many simultaneous merges.
 #[derive(Debug, Clone)]
 pub struct MergeStorm {
-    /// The merge nodes that are part of this storm.
-    pub merge_nodes: Vec<String>,
-    /// The central position of the storm (x, y) normalized.
-    pub center: (f64, f64),
-    /// The intensity of the storm (0.0 to 1.0), based on number of merges and proximity.
+    /// The central commit ID where the storm occurs
+    pub epicenter: String,
+    /// Number of branches involved in the storm
+    pub branch_count: usize,
+    /// Total commits in the storm window
+    pub commit_count: usize,
+    /// The time window (in seconds) during which the storm occurred
+    pub time_window_secs: f64,
+    /// Intensity score (0.0 to 1.0) based on branch density
     pub intensity: f64,
-    /// The radius of the storm's root system.
-    pub radius: f64,
+    /// List of branch names involved
+    pub branches: Vec<String>,
+    /// Commit IDs of all commits in the storm
+    pub commit_ids: Vec<String>,
 }
 
-/// Detects merge storms in the forest by clustering merge nodes that are close in time.
-/// A storm is defined as a group of 3 or more merge commits within a short time window.
-pub fn detect_merge_storms(forest: &Forest, time_window_seconds: u64) -> Vec<MergeStorm> {
-    let mut storms: Vec<MergeStorm> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
+/// Detect merge storms in the forest.
+/// A merge storm is defined as a commit that has more than `threshold` parents
+/// or a cluster of merges within a short time window.
+pub fn detect_merge_storms(
+    forest: &Forest,
+    threshold: usize,
+    time_window: f64,
+) -> Vec<MergeStorm> {
+    let mut storms = Vec::new();
+    let mut visited = HashSet::new();
 
-    // Collect all merge nodes with their timestamps
-    let mut merge_times: Vec<(String, u64)> = Vec::new();
-    for (id, _) in &forest.merge_map {
-        if let Some(node) = forest.commit_map.get(id) {
-            merge_times.push((id.clone(), node.time));
+    // Build a map from commit ID to its timestamp
+    let timestamps: HashMap<&String, f64> = forest
+        .commit_map
+        .iter()
+        .map(|(id, node)| (id, node.timestamp))
+        .collect();
+
+    // Find merge points (commits with >1 parent)
+    let merges: Vec<&CommitNode> = forest
+        .commit_map
+        .values()
+        .filter(|node| node.parents.len() > 1)
+        .collect();
+
+    // Cluster merges by time proximity
+    let mut merge_clusters: Vec<Vec<&CommitNode>> = Vec::new();
+
+    for merge in &merges {
+        if visited.contains(&merge.id) {
+            continue;
         }
-    }
 
-    // Sort by time
-    merge_times.sort_by(|a, b| a.1.cmp(&b.1));
+        let mut cluster = vec![*merge];
+        visited.insert(merge.id.clone());
 
-    // Sliding window to find clusters
-    let mut window_start = 0;
-    for window_end in 0..merge_times.len() {
-        let current_time = merge_times[window_end].1;
-        // Advance window start until within time window
-        while window_start < window_end && current_time - merge_times[window_start].1 > time_window_seconds {
-            window_start += 1;
-        }
-        let window_size = window_end - window_start + 1;
-        if window_size >= 3 {
-            // Check if we have already formed a storm for this window
-            let storm_nodes: Vec<String> = merge_times[window_start..=window_end]
-                .iter()
-                .map(|(id, _)| id.clone())
-                .collect();
-            // Only create a new storm if at least 3 nodes are not already in a storm
-            let unvisited_count = storm_nodes.iter().filter(|id| !visited.contains(*id)).count();
-            if unvisited_count >= 3 {
-                let center_time = (merge_times[window_start].1 + merge_times[window_end].1) / 2;
-                // Compute an approximate center position: average of tree centers
-                let mut x_sum = 0.0;
-                let mut y_sum = 0.0;
-                let mut count = 0;
-                for id in &storm_nodes {
-                    if let Some(pos) = forest.merge_map.get(id) {
-                        x_sum += pos.0;
-                        y_sum += pos.1;
-                        count += 1;
-                    }
+        // Find nearby merges within the time window
+        for other in &merges {
+            if visited.contains(&other.id) {
+                continue;
+            }
+            if let (Some(t1), Some(t2)) = (timestamps.get(&merge.id), timestamps.get(&other.id)) {
+                if (t1 - t2).abs() <= time_window {
+                    cluster.push(*other);
+                    visited.insert(other.id.clone());
                 }
-                let center = if count > 0 {
-                    (x_sum / count as f64, y_sum / count as f64)
-                } else {
-                    (0.5, 0.5)
-                };
-                let intensity = (window_size as f64 / 10.0).min(1.0);
-                let radius = 0.05 + (window_size as f64 * 0.02).min(0.3);
-                let storm = MergeStorm {
-                    merge_nodes: storm_nodes.clone(),
-                    center,
-                    intensity,
-                    radius,
-                };
-                for id in &storm_nodes {
-                    visited.insert(id.clone());
-                }
-                storms.push(storm);
             }
         }
+
+        if cluster.len() >= threshold {
+            merge_clusters.push(cluster);
+        }
     }
 
-    // Merge overlapping storms (if centers are close)
-    merge_overlapping_storms(&mut storms);
+    // Convert clusters to MergeStorm objects
+    for cluster in merge_clusters {
+        let mut branch_set = HashSet::new();
+        let mut all_ids = Vec::new();
+        let mut total_parents = 0;
+
+        for node in &cluster {
+            all_ids.push(node.id.clone());
+            // Collect branch names from parents
+            for parent_id in &node.parents {
+                if let Some(parent) = forest.commit_map.get(parent_id) {
+                    branch_set.insert(parent.branch.clone());
+                }
+            }
+            total_parents += node.parents.len();
+        }
+
+        let branches: Vec<String> = branch_set.into_iter().collect();
+        let branch_count = branches.len();
+        let commit_count = all_ids.len();
+
+        // Intensity: ratio of branches to commits, normalized
+        let intensity = if commit_count > 0 {
+            (branch_count as f64 / commit_count as f64).min(1.0)
+        } else {
+            0.0
+        };
+
+        // Calculate time window
+        let timestamps_cluster: Vec<f64> = cluster
+            .iter()
+            .filter_map(|node| timestamps.get(&node.id))
+            .copied()
+            .collect();
+        let time_window_secs = if timestamps_cluster.len() >= 2 {
+            let min_t = timestamps_cluster.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max_t = timestamps_cluster.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            (max_t - min_t).max(0.0)
+        } else {
+            0.0
+        };
+
+        // Use the first merge as epicenter
+        let epicenter = cluster[0].id.clone();
+
+        storms.push(MergeStorm {
+            epicenter,
+            branch_count,
+            commit_count,
+            time_window_secs,
+            intensity,
+            branches,
+            commit_ids: all_ids,
+        });
+    }
 
     storms
 }
 
-/// Merges storms whose centers are within a small distance of each other.
-fn merge_overlapping_storms(storms: &mut Vec<MergeStorm>) {
-    let mut merged = true;
-    while merged {
-        merged = false;
-        let mut i = 0;
-        while i < storms.len() {
-            let mut j = i + 1;
-            while j < storms.len() {
-                let dx = storms[i].center.0 - storms[j].center.0;
-                let dy = storms[i].center.1 - storms[j].center.1;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let threshold = (storms[i].radius + storms[j].radius) * 0.5;
-                if dist < threshold {
-                    // Merge j into i
-                    let storm_j = storms.remove(j);
-                    storms[i].merge_nodes.extend(storm_j.merge_nodes);
-                    storms[i].intensity = (storms[i].intensity + storm_j.intensity).min(1.0);
-                    storms[i].radius = storms[i].radius.max(storm_j.radius);
-                    // Recompute center as weighted average by intensity
-                    let total_intensity = storms[i].intensity + storm_j.intensity;
-                    if total_intensity > 0.0 {
-                        storms[i].center.0 = (storms[i].center.0 * storms[i].intensity + storm_j.center.0 * storm_j.intensity) / total_intensity;
-                        storms[i].center.1 = (storms[i].center.1 * storms[i].intensity + storm_j.center.1 * storm_j.intensity) / total_intensity;
-                    }
-                    merged = true;
-                } else {
-                    j += 1;
-                }
-            }
-            i += 1;
+/// Generate a tangled root system visualization for a merge storm.
+/// Returns a vector of (x, y) coordinates representing root curves.
+pub fn generate_tangled_roots(
+    storm: &MergeStorm,
+    center_x: f64,
+    center_y: f64,
+    spread: f64,
+) -> Vec<(f64, f64)> {
+    let mut roots = Vec::new();
+    let num_roots = storm.branch_count.max(2);
+    let angle_step = std::f64::consts::PI * 2.0 / num_roots as f64;
+
+    for i in 0..num_roots {
+        let base_angle = angle_step * i as f64 + storm.intensity * 0.5;
+        let length = spread * (0.5 + storm.intensity * 0.5);
+        let segments = 10;
+
+        for j in 0..=segments {
+            let t = j as f64 / segments as f64;
+            let angle = base_angle + t * storm.intensity * 1.5;
+            let radius = t * length * (1.0 + 0.3 * (t * 3.0).sin());
+            let x = center_x + radius * angle.cos();
+            let y = center_y + radius * angle.sin();
+            roots.push((x, y));
         }
     }
+
+    roots
 }
+
+/// Highlight merge storms in the forest by adding visual markers.
+/// Returns a map of commit ID -> intensity for colored rendering.
+pub fn highlight_merge_storms(
+    forest: &Forest,
+    threshold: usize,
+    time_window: f64,
+) -> HashMap<String, f64> {
+    let storms = detect_merge_storms(forest, threshold, time_window);
+    let mut highlights = HashMap::new();
+
+    for storm in &storms {
+        for id in &storm.commit_ids {
+            highlights.insert(id.clone(), storm.intensity);
+        }
+    }
+
+    highlights
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Forest, CommitNode};
+    use std::collections::HashMap;
+
+    fn create_test_forest() -> Forest {
+        let mut commit_map = HashMap::new();
+        // Create a merge storm: commit 'c' has 3 parents
+        commit_map.insert(
+            "a".to_string(),
+            CommitNode {
+                id: "a".to_string(),
+                author: "alice".to_string(),
+                timestamp: 1000.0,
+                parents: vec![],
+                branch: "main".to_string(),
+                message: "initial".to_string(),
+            },
+        );
+        commit_map.insert(
+            "b".to_string(),
+            CommitNode {
+                id: "b".to_string(),
+                author: "bob".to_string(),
+                timestamp: 1001.0,
+                parents: vec!["a".to_string()],
+                branch: "feature".to_string(),
+                message: "work".to_string(),
+            }
