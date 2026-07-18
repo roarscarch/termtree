@@ -43,51 +43,132 @@ fn hsl_to_rgb(h: f64, s: f64, l: f64) -> (u8, u8, u8) {
     )
 }
 
+/// Apply a color tag to a string for terminal output using termion.
+pub fn colorize(text: &str, r: u8, g: u8, b: u8) -> String {
+    format!(
+        "{}{}{}",
+        termion::color::Fg(termion::color::Rgb(r, g, b)),
+        text,
+        termion::color::Fg(termion::color::Reset)
+    )
+}
+
+/// Return a brightness-adjusted version of the given color for highlighting.
+pub fn highlight_color(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let factor = 1.3;
+    (
+        (r as f64 * factor).min(255.0) as u8,
+        (g as f64 * factor).min(255.0) as u8,
+        (b as f64 * factor).min(255.0) as u8,
+    )
+}
+
+/// Return a dimmed version of the given color for background or inactive elements.
+pub fn dim_color(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+    let factor = 0.6;
+    (
+        (r as f64 * factor) as u8,
+        (g as f64 * factor) as u8,
+        (b as f64 * factor) as u8,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_assign_author_colors_empty() {
+    fn test_hsl_to_rgb_red() {
+        let (r, g, b) = hsl_to_rgb(0.0, 1.0, 0.5);
+        assert_eq!(r, 255);
+        assert_eq!(g, 0);
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn test_hsl_to_rgb_green() {
+        let (r, g, b) = hsl_to_rgb(120.0, 1.0, 0.5);
+        assert_eq!(r, 0);
+        assert_eq!(g, 255);
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn test_hsl_to_rgb_blue() {
+        let (r, g, b) = hsl_to_rgb(240.0, 1.0, 0.5);
+        assert_eq!(r, 0);
+        assert_eq!(g, 0);
+        assert_eq!(b, 255);
+    }
+
+    #[test]
+    fn test_assign_author_colors_empty_forest() {
         let forest = Forest {
-            trees: vec![],
+            trees: Vec::new(),
             commit_map: HashMap::new(),
-            merges: vec![],
+            root: String::new(),
+            merge_points: Vec::new(),
         };
         let colors = assign_author_colors(&forest);
         assert!(colors.is_empty());
     }
 
     #[test]
-    fn test_assign_author_colors_distinct() {
-        use std::collections::HashSet;
-        let mut commit_map = HashMap::new();
-        commit_map.insert("alice".to_string(), crate::CommitNode {
-            id: "abc".to_string(),
-            author: "alice".to_string(),
-            time: 100,
-            message: "msg".to_string(),
-            parents: vec![],
-        });
-        commit_map.insert("bob".to_string(), crate::CommitNode {
-            id: "def".to_string(),
-            author: "bob".to_string(),
-            time: 200,
-            message: "msg2".to_string(),
-            parents: vec![],
-        });
-        let forest = Forest {
-            trees: vec![],
-            commit_map,
-            merges: vec![],
+    fn test_assign_author_colors_unique() {
+        let mut forest = Forest {
+            trees: Vec::new(),
+            commit_map: HashMap::new(),
+            root: String::new(),
+            merge_points: Vec::new(),
         };
+        forest.commit_map.insert("author1".to_string(), crate::CommitNode {
+            id: "abc".to_string(),
+            author: "author1".to_string(),
+            message: "msg".to_string(),
+            timestamp: 0,
+            parent_ids: Vec::new(),
+            children_ids: Vec::new(),
+            branch_id: 0,
+            x: 0.0,
+            y: 0.0,
+        });
+        forest.commit_map.insert("author2".to_string(), crate::CommitNode {
+            id: "def".to_string(),
+            author: "author2".to_string(),
+            message: "msg2".to_string(),
+            timestamp: 1,
+            parent_ids: Vec::new(),
+            children_ids: Vec::new(),
+            branch_id: 1,
+            x: 0.0,
+            y: 0.0,
+        });
         let colors = assign_author_colors(&forest);
         assert_eq!(colors.len(), 2);
-        // Colors should be different
-        let mut unique: HashSet<(u8,u8,u8)> = HashSet::new();
-        for c in colors.values() {
-            unique.insert(*c);
-        }
-        assert_eq!(unique.len(), 2);
+        // Ensure colors are different
+        assert_ne!(colors.get("author1"), colors.get("author2"));
+    }
+
+    #[test]
+    fn test_colorize() {
+        let result = colorize("hello", 255, 0, 0);
+        assert!(result.contains("hello"));
+        assert!(result.contains("\x1b[38;2;255;0;0m"));
+    }
+
+    #[test]
+    fn test_highlight_color() {
+        let (r, g, b) = highlight_color(100, 100, 100);
+        assert!(r > 100);
+        assert!(g > 100);
+        assert!(b > 100);
+    }
+
+    #[test]
+    fn test_dim_color() {
+        let (r, g, b) = dim_color(200, 200, 200);
+        assert!(r < 200);
+        assert!(g < 200);
+        assert!(b < 200);
     }
 }
