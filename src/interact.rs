@@ -1,22 +1,25 @@
-use crate::{Forest, Tree, MergeNode, CommitNode};
+use crate::{Forest, Tree, CommitNode, MergeNode, LayoutResult};
+use termion::{color, cursor};
 use std::collections::HashMap;
-use termion::event::Key;
-use termion::input::TermRead;
-use termion::raw::IntoRawMode;
-use termion::cursor;
-use termion::clear;
-use termion::color;
-use std::io::{self, Write, stdin, stdout};
 
-/// Represents the interactive view state
-#[derive(Debug)]
+/// View state for interactive forest browsing.
+#[derive(Debug, Clone)]
 pub struct InteractiveView {
+    /// Horizontal scroll offset in grid units
     pub offset_x: f64,
+    /// Vertical scroll offset in grid units
     pub offset_y: f64,
+    /// Zoom level (1.0 = normal)
     pub zoom: f64,
-    pub selected_commit: Option<CommitNode>,
-    pub selected_tree: Option<String>,
+    /// Currently selected commit id (if any)
+    pub selected_commit: Option<String>,
+    /// Currently selected tree index (if any)
+    pub selected_tree: Option<usize>,
+    /// Whether the info panel is visible
     pub info_visible: bool,
+    /// Terminal dimensions cached for rendering
+    pub term_width: u16,
+    pub term_height: u16,
 }
 
 impl Default for InteractiveView {
@@ -28,164 +31,148 @@ impl Default for InteractiveView {
             selected_commit: None,
             selected_tree: None,
             info_visible: false,
+            term_width: 80,
+            term_height: 24,
         }
     }
 }
 
-/// Find the commit nearest to a screen position (leaf click)
+/// Find the commit at a given screen position.
+/// Returns the commit id if one is found within a small radius.
 pub fn find_commit_at_position(
     forest: &Forest,
+    layout: &LayoutResult,
+    view: &InteractiveView,
     screen_x: u16,
     screen_y: u16,
-    view: &InteractiveView,
-    author_colors: &HashMap<String, (u8, u8, u8)>,
-) -> Option<CommitNode> {
-    let world_x = (screen_x as f64 - view.offset_x) / view.zoom;
-    let world_y = (screen_y as f64 - view.offset_y) / view.zoom;
+) -> Option<String> {
+    // Convert screen coordinates to world coordinates
+    let world_x = (screen_x as f64 / view.zoom) + view.offset_x;
+    let world_y = (screen_y as f64 / view.zoom) + view.offset_y;
 
-    for (_, commit) in &forest.commit_map {
-        let dx = commit.x - world_x;
-        let dy = commit.y - world_y;
-        let dist = (dx * dx + dy * dy).sqrt();
-        // Click radius of 3 in world coordinates
-        if dist < 3.0 {
-            return Some(commit.clone());
+    // Check all commits in the forest
+    for (commit_id, commit_node) in &forest.commit_map {
+        if let Some(pos) = layout.grid_positions.get(commit_id) {
+            let dx = pos.x - world_x;
+            let dy = pos.y - world_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            // Within a small radius (0.5 grid units)
+            if distance < 0.5 {
+                return Some(commit_id.clone());
+            }
         }
     }
+
+    // Check merge nodes
+    for merge_node in &forest.merge_nodes {
+        if let Some(pos) = layout.grid_positions.get(&merge_node.id) {
+            let dx = pos.x - world_x;
+            let dy = pos.y - world_y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance < 0.5 {
+                return Some(merge_node.id.clone());
+            }
+        }
+    }
+
     None
 }
 
-/// Run the interactive loop until user quits
-pub fn run_interactive(
-    forest: &Forest,
-    author_colors: &HashMap<String, (u8, u8, u8)>,
-) -> io::Result<()> {
-    let stdout = stdout();
-    let mut stdout = stdout.lock().into_raw_mode()?;
-    let stdin = stdin();
-    let mut keys = stdin.keys();
-
-    let mut view = InteractiveView::default();
-
-    write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
-    render_forest_interactive(&mut stdout, forest, &view, author_colors)?;
-    stdout.flush()?;
-
-    loop {
-        if let Some(key) = keys.next() {
-            match key? {
-                Key::Char('q') => break,
-                Key::Left => view.offset_x -= 5.0,
-                Key::Right => view.offset_x += 5.0,
-                Key::Up => view.offset_y -= 5.0,
-                Key::Down => view.offset_y += 5.0,
-                Key::Char('+') | Key::Char('=') => view.zoom *= 1.1,
-                Key::Char('-') | Key::Char('_') => view.zoom /= 1.1,
-                Key::Char('i') => view.info_visible = !view.info_visible,
-                Key::Esc => break,
-                _ => {}
-            }
-
-            write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
-            render_forest_interactive(&mut stdout, forest, &view, author_colors)?;
-            stdout.flush()?;
-        }
-    }
-
-    write!(stdout, "{}{}", clear::All, cursor::Goto(1, 1))?;
-    writeln!(stdout, "Exited interactive mode.")?;
-    stdout.flush()?;
-    Ok(())
+/// Convert a screen coordinate to world coordinate given the view state.
+pub fn screen_to_world(view: &InteractiveView, screen_x: f64, screen_y: f64) -> (f64, f64) {
+    let world_x = (screen_x / view.zoom) + view.offset_x;
+    let world_y = (screen_y / view.zoom) + view.offset_y;
+    (world_x, world_y)
 }
 
-/// Render the forest to the terminal with current view state
-fn render_forest_interactive<W: Write>(
-    w: &mut W,
-    forest: &Forest,
-    view: &InteractiveView,
-    author_colors: &HashMap<String, (u8, u8, u8)>,
-) -> io::Result<()> {
-    // Determine terminal size (approximate)
-    let term_width = 80;
-    let term_height = 24;
+/// Convert a world coordinate back to screen coordinate.
+pub fn world_to_screen(view: &InteractiveView, world_x: f64, world_y: f64) -> (f64, f64) {
+    let screen_x = (world_x - view.offset_x) * view.zoom;
+    let screen_y = (world_y - view.offset_y) * view.zoom;
+    (screen_x, screen_y)
+}
 
-    // Draw trees
-    for (tree_id, tree) in &forest.trees {
-        let trunk_x = tree.trunk_x * view.zoom + view.offset_x;
-        let trunk_y = tree.trunk_y * view.zoom + view.offset_y;
+/// Compute the visible world rectangle based on the view state.
+pub fn visible_world_rect(view: &InteractiveView) -> (f64, f64, f64, f64) {
+    let left = view.offset_x;
+    let top = view.offset_y;
+    let right = left + (view.term_width as f64 / view.zoom);
+    let bottom = top + (view.term_height as f64 / view.zoom);
+    (left, top, right, bottom)
+}
 
-        // Draw trunk as vertical line
-        for i in 0..tree.height as usize {
-            let screen_x = trunk_x as u16;
-            let screen_y = (trunk_y - i as f64 * view.zoom) as u16;
-            if screen_x < term_width && screen_y < term_height {
-                // Color by author of first commit in tree
-                let author = &tree.commits.first().map(|c| c.author.clone()).unwrap_or_default();
-                let color = author_colors.get(author).copied().unwrap_or((100, 180, 100));
-                write!(
-                    w,
-                    "{}{}{}█{}",
-                    cursor::Goto(screen_x + 1, screen_y + 1),
-                    color::Fg(color::Rgb(color.0, color.1, color.2)),
-                    color::Bg(color::Rgb(20, 40, 20)),
-                    color::Fg(color::Reset)
-                )?;
-            }
-        }
+/// Render a simple cursor position indicator for debugging.
+pub fn render_cursor_indicator(
+    screen_x: u16,
+    screen_y: u16,
+    commit_id: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    output.push_str(&cursor::Goto(screen_x, screen_y).to_string());
+    output.push_str(&color::Fg(color::LightYellow).to_string());
+    if let Some(id) = commit_id {
+        output.push_str(&format!("[{}]", &id[..id.len().min(7)]));
+    } else {
+        output.push_str("[   ]");
+    }
+    output.push_str(&color::Fg(color::Reset).to_string());
+    output
+}
 
-        // Draw leaves (commits) as colored dots along the trunk
-        for (i, commit) in tree.commits.iter().enumerate() {
-            let leaf_y = (trunk_y - i as f64 * view.zoom) as u16;
-            let leaf_x = trunk_x as u16;
-            if leaf_x < term_width && leaf_y < term_height {
-                let color = author_colors.get(&commit.author).copied().unwrap_or((200, 200, 100));
-                let symbol = if view.selected_commit.as_ref().map(|c| c.id == commit.id).unwrap_or(false) {
-                    "*"
-                } else {
-                    "•"
-                };
-                write!(
-                    w,
-                    "{}{}{}{}{}",
-                    cursor::Goto(leaf_x + 1, leaf_y + 1),
-                    color::Fg(color::Rgb(color.0, color.1, color.2)),
-                    color::Bg(color::Rgb(10, 30, 10)),
-                    symbol,
-                    color::Fg(color::Reset)
-                )?;
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_screen_to_world_identity() {
+        let view = InteractiveView::default();
+        let (wx, wy) = screen_to_world(&view, 0.0, 0.0);
+        assert!((wx - 0.0).abs() < 1e-6);
+        assert!((wy - 0.0).abs() < 1e-6);
     }
 
-    // Draw merge roots
-    for (_, merge) in &forest.merges {
-        let mx = merge.x * view.zoom + view.offset_x;
-        let my = merge.y * view.zoom + view.offset_y;
-        let mx_u = mx as u16;
-        let my_u = my as u16;
-        if mx_u < term_width && my_u < term_height {
-            write!(
-                w,
-                "{}{}⚡{}",
-                cursor::Goto(mx_u + 1, my_u + 1),
-                color::Fg(color::Rgb(255, 200, 50)),
-                color::Fg(color::Reset)
-            )?;
-        }
+    #[test]
+    fn test_screen_to_world_with_offset() {
+        let mut view = InteractiveView::default();
+        view.offset_x = 5.0;
+        view.offset_y = 10.0;
+        let (wx, wy) = screen_to_world(&view, 0.0, 0.0);
+        assert!((wx - 5.0).abs() < 1e-6);
+        assert!((wy - 10.0).abs() < 1e-6);
     }
 
-    // Draw info panel if visible
-    if view.info_visible {
-        if let Some(commit) = &view.selected_commit {
-            let details = format_commit_details_interactive(commit, author_colors);
-            let lines: Vec<&str> = details.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if i < term_height as usize {
-                    write!(
-                        w,
-                        "{}{}",
-                        cursor::Goto(1, (term_height - 5 + i as u16).min(term_height)),
-                        line
-                    )?;
-                }
-            }
+    #[test]
+    fn test_screen_to_world_with_zoom() {
+        let mut view = InteractiveView::default();
+        view.zoom = 2.0;
+        let (wx, wy) = screen_to_world(&view, 10.0, 20.0);
+        assert!((wx - 5.0).abs() < 1e-6);
+        assert!((wy - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_world_to_screen() {
+        let mut view = InteractiveView::default();
+        view.offset_x = 3.0;
+        view.offset_y = 4.0;
+        view.zoom = 0.5;
+        let (sx, sy) = world_to_screen(&view, 7.0, 8.0);
+        assert!((sx - 2.0).abs() < 1e-6);
+        assert!((sy - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_visible_world_rect() {
+        let mut view = InteractiveView::default();
+        view.offset_x = 10.0;
+        view.offset_y = 20.0;
+        view.term_width = 80;
+        view.term_height = 24;
+        view.zoom = 2.0;
+        let (left, top, right, bottom) = visible_world_rect(&view);
+        assert!((left - 10.0).abs() < 1e-6);
+        assert!((top - 20.0).abs() < 1e-6);
+        assert!((right - 50.0).abs() < 1e-6);
+        assert!((bottom - 32.0).abs() < 1e-6);
+    }
+}
