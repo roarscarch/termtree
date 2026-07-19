@@ -1,200 +1,201 @@
-use crate::{Forest, Tree, CommitNode, MergeNode};
+use crate::{Forest, CommitNode, MergeNode, Tree};
 use std::collections::HashMap;
 
-/// Statistics for a single tree (branch)
-#[derive(Debug, Clone)]
-pub struct TreeStats {
-    pub name: String,
-    pub commit_count: usize,
-    pub merge_count: usize,
-    pub depth: usize,
-    pub width: usize,
-    pub author: String,
-    pub first_commit_time: Option<i64>,
-    pub last_commit_time: Option<i64>,
-    pub leaf_count: usize,
-}
-
-/// Overall forest statistics
+/// Statistics about a forest's commit graph.
 #[derive(Debug, Clone)]
 pub struct ForestStats {
-    pub total_trees: usize,
+    /// Total number of commits
     pub total_commits: usize,
-    pub total_merges: usize,
-    pub total_authors: usize,
-    pub average_depth: f64,
-    pub average_width: f64,
-    pub bus_factor: usize,
-    pub tree_stats: Vec<TreeStats>,
-    pub author_commit_counts: HashMap<String, usize>,
-    pub merge_storms: Vec<MergeStorm>,
-}
-
-/// Information about a merge storm (many simultaneous merges)
-#[derive(Debug, Clone)]
-pub struct MergeStorm {
-    pub time_range: (i64, i64),
+    /// Number of branches (tips)
+    pub branch_count: usize,
+    /// Number of merge commits
     pub merge_count: usize,
-    pub involved_branches: Vec<String>,
+    /// Number of unique authors
+    pub author_count: usize,
+    /// Commits per author (author name -> count)
+    pub commits_per_author: HashMap<String, usize>,
+    /// Commits per day (YYYY-MM-DD -> count)
+    pub commits_per_day: HashMap<String, usize>,
+    /// Average commits per branch
+    pub avg_commits_per_branch: f64,
+    /// Longest branch length (in commits)
+    pub longest_branch: usize,
+    /// Shortest branch length (in commits)
+    pub shortest_branch: usize,
+    /// Merge frequency (merges per 100 commits)
+    pub merge_frequency: f64,
+    /// Number of merge storms detected
+    pub merge_storm_count: usize,
+    /// Total lines of code changed (additions + deletions) across all commits
+    pub total_lines_changed: i64,
+    /// Date range (earliest and latest commit timestamps)
+    pub date_range: Option<(String, String)>,
 }
 
-/// Compute statistics for the entire forest
-pub fn compute_forest_stats(forest: &Forest) -> ForestStats {
-    let mut total_commits = 0;
-    let mut total_merges = 0;
-    let mut author_commit_counts: HashMap<String, usize> = HashMap::new();
-    let mut tree_stats = Vec::new();
-    let mut all_commit_times: Vec<(i64, &str)> = Vec::new(); // (timestamp, branch_name)
+/// Compute statistics from a forest.
+pub fn compute_stats(forest: &Forest) -> ForestStats {
+    let total_commits = forest.commit_map.len();
+    let mut authors: HashMap<String, usize> = HashMap::new();
+    let mut days: HashMap<String, usize> = HashMap::new();
+    let mut merge_count = 0;
+    let mut branch_lengths: Vec<usize> = Vec::new();
+    let mut total_lines: i64 = 0;
+    let mut timestamps: Vec<i64> = Vec::new();
 
-    for tree in &forest.trees {
-        let mut commit_count = 0;
-        let mut merge_count = 0;
-        let mut depth = 0;
-        let mut width = 0;
-        let mut first_time: Option<i64> = None;
-        let mut last_time: Option<i64> = None;
-        let mut leaf_count = 0;
+    // Build reverse map: children for each commit
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, node) in &forest.commit_map {
+        let author = &node.author;
+        *authors.entry(author.clone()).or_insert(0) += 1;
 
-        // Traverse all nodes in the tree
-        for node in &tree.nodes {
-            match node {
-                CommitNode::Regular(c) => {
-                    commit_count += 1;
-                    *author_commit_counts.entry(c.author.clone()).or_insert(0) += 1;
-                    if let Some(ts) = c.timestamp {
-                        if first_time.map_or(true, |ft| ts < ft) {
-                            first_time = Some(ts);
-                        }
-                        if last_time.map_or(true, |lt| ts > lt) {
-                            last_time = Some(ts);
-                        }
-                        all_commit_times.push((ts, &tree.name));
-                    }
-                    if c.is_leaf {
-                        leaf_count += 1;
-                    }
-                }
-                CommitNode::Merge(m) => {
-                    merge_count += 1;
-                    total_merges += 1;
-                    *author_commit_counts.entry(m.author.clone()).or_insert(0) += 1;
-                    if let Some(ts) = m.timestamp {
-                        if first_time.map_or(true, |ft| ts < ft) {
-                            first_time = Some(ts);
-                        }
-                        if last_time.map_or(true, |lt| ts > lt) {
-                            last_time = Some(ts);
-                        }
-                        all_commit_times.push((ts, &tree.name));
-                    }
+        // Day from timestamp
+        if let Some(ts) = node.timestamp {
+            let secs = ts as i64;
+            timestamps.push(secs);
+            // Convert to date string (simple: use chrono if available, else approximate)
+            let days_since_epoch = secs / 86400;
+            let date = format_date_from_epoch(days_since_epoch);
+            *days.entry(date).or_insert(0) += 1;
+        }
+
+        if node.parents.len() > 1 {
+            merge_count += 1;
+        }
+
+        // Accumulate lines changed if available
+        if let Some(lines) = node.lines_changed {
+            total_lines += lines;
+        }
+
+        // Build children mapping
+        for parent_id in &node.parents {
+            children.entry(parent_id.clone()).or_default().push(id.clone());
+        }
+    }
+
+    // Compute branch lengths: walk from root commits to leaves
+    // Find root commits (commits with no children)
+    let mut roots: Vec<&String> = Vec::new();
+    for id in forest.commit_map.keys() {
+        if !children.contains_key(id) || children[id].is_empty() {
+            roots.push(id);
+        }
+    }
+
+    // DFS from each root to compute branch lengths
+    for root in roots {
+        let mut stack = vec![(root.clone(), 1usize)];
+        while let Some((node_id, depth)) = stack.pop() {
+            branch_lengths.push(depth);
+            if let Some(child_ids) = children.get(&node_id) {
+                for child in child_ids {
+                    stack.push((child.clone(), depth + 1));
                 }
             }
         }
-
-        // Compute depth (max chain length) and width (max branches at any level)
-        // Simple approximation: depth = number of levels in tree
-        depth = forest.layout.as_ref().map(|l| l.depths.get(&tree.name).copied().unwrap_or(0)).unwrap_or(0);
-        width = forest.layout.as_ref().map(|l| l.widths.get(&tree.name).copied().unwrap_or(0)).unwrap_or(0);
-
-        total_commits += commit_count;
-
-        let author = if !tree.nodes.is_empty() {
-            match &tree.nodes[0] {
-                CommitNode::Regular(c) => c.author.clone(),
-                CommitNode::Merge(m) => m.author.clone(),
-            }
-        } else {
-            String::from("unknown")
-        };
-
-        tree_stats.push(TreeStats {
-            name: tree.name.clone(),
-            commit_count,
-            merge_count,
-            depth,
-            width,
-            author,
-            first_commit_time: first_time,
-            last_commit_time: last_time,
-            leaf_count,
-        });
     }
 
-    // Sort tree stats by commit count descending
-    tree_stats.sort_by(|a, b| b.commit_count.cmp(&a.commit_count));
-
-    // Detect merge storms: clusters of merges close in time
-    let merge_storms = detect_merge_storms(&all_commit_times, 60); // 60-second window
-
-    let total_authors = author_commit_counts.len();
-    let average_depth = if !tree_stats.is_empty() {
-        tree_stats.iter().map(|t| t.depth as f64).sum::<f64>() / tree_stats.len() as f64
+    let branch_count = branch_lengths.len();
+    let avg_commits_per_branch = if branch_count > 0 {
+        branch_lengths.iter().sum::<usize>() as f64 / branch_count as f64
     } else {
         0.0
     };
-    let average_width = if !tree_stats.is_empty() {
-        tree_stats.iter().map(|t| t.width as f64).sum::<f64>() / tree_stats.len() as f64
+    let longest_branch = branch_lengths.iter().cloned().max().unwrap_or(0);
+    let shortest_branch = branch_lengths.iter().cloned().min().unwrap_or(0);
+    let merge_frequency = if total_commits > 0 {
+        merge_count as f64 / total_commits as f64 * 100.0
     } else {
         0.0
     };
 
-    // Bus factor: number of authors responsible for 50% of commits
-    let mut sorted_author_counts: Vec<usize> = author_commit_counts.values().copied().collect();
-    sorted_author_counts.sort_by(|a, b| b.cmp(a));
-    let half_commits = total_commits / 2;
-    let mut cumulative = 0;
-    let mut bus_factor = 0;
-    for count in &sorted_author_counts {
-        cumulative += count;
-        bus_factor += 1;
-        if cumulative >= half_commits {
-            break;
-        }
-    }
+    // Merge storms: we can count from layout if available, otherwise estimate
+    let merge_storm_count = forest.merge_storms.len();
+
+    // Date range
+    let date_range = if timestamps.is_empty() {
+        None
+    } else {
+        let min_ts = timestamps.iter().min().unwrap();
+        let max_ts = timestamps.iter().max().unwrap();
+        let min_days = min_ts / 86400;
+        let max_days = max_ts / 86400;
+        Some((
+            format_date_from_epoch(min_days),
+            format_date_from_epoch(max_days),
+        ))
+    };
 
     ForestStats {
-        total_trees: forest.trees.len(),
         total_commits,
-        total_merges,
-        total_authors,
-        average_depth,
-        average_width,
-        bus_factor,
-        tree_stats,
-        author_commit_counts,
-        merge_storms,
+        branch_count,
+        merge_count,
+        author_count: authors.len(),
+        commits_per_author: authors,
+        commits_per_day: days,
+        avg_commits_per_branch,
+        longest_branch,
+        shortest_branch,
+        merge_frequency,
+        merge_storm_count,
+        total_lines_changed: total_lines,
+        date_range,
     }
 }
 
-/// Detect merge storms: clusters of merges within a time window
-fn detect_merge_storms(commits: &[(i64, &str)], window_seconds: i64) -> Vec<MergeStorm> {
-    if commits.is_empty() {
-        return Vec::new();
-    }
-
-    let mut sorted_commits: Vec<(i64, &str)> = commits.to_vec();
-    sorted_commits.sort_by_key(|k| k.0);
-
-    let mut storms = Vec::new();
-    let mut i = 0;
-    while i < sorted_commits.len() {
-        let start_time = sorted_commits[i].0;
-        let end_time = start_time + window_seconds;
-        let mut cluster: Vec<(i64, &str)> = Vec::new();
-        while i < sorted_commits.len() && sorted_commits[i].0 <= end_time {
-            cluster.push(sorted_commits[i]);
-            i += 1;
+/// Format a date from days since epoch (simple: no external crate dependency).
+fn format_date_from_epoch(days_since_epoch: i64) -> String {
+    // Approximate: Jan 1 1970 = 0 days
+    // Use a simple algorithm
+    let mut y = 1970i64;
+    let mut remaining = days_since_epoch;
+    loop {
+        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
+        if remaining < days_in_year {
+            break;
         }
-        if cluster.len() >= 3 {
-            let mut branches: Vec<String> = cluster.iter().map(|(_, b)| b.to_string()).collect();
-            branches.sort();
-            branches.dedup();
-            storms.push(MergeStorm {
-                time_range: (cluster[0].0, cluster[cluster.len() - 1].0),
-                merge_count: cluster.len(),
-                involved_branches: branches,
-            });
-        }
+        remaining -= days_in_year;
+        y += 1;
     }
-    storms
+    let months = [31, if is_leap_year(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for (i, &days) in months.iter().enumerate() {
+        if remaining < days {
+            m = i + 1;
+            break;
+        }
+        remaining -= days;
+    }
+    let d = remaining + 1;
+    format!("{:04}-{:02}-{:02}", y, m, d)
 }
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Forest, CommitNode, MergeStorm};
+
+    #[test]
+    fn test_compute_stats_empty() {
+        let forest = Forest {
+            commit_map: HashMap::new(),
+            merge_storms: Vec::new(),
+        };
+        let stats = compute_stats(&forest);
+        assert_eq!(stats.total_commits, 0);
+        assert_eq!(stats.branch_count, 0);
+        assert_eq!(stats.merge_count, 0);
+        assert_eq!(stats.author_count, 0);
+        assert!(stats.date_range.is_none());
+    }
+
+    #[test]
+    fn test_compute_stats_single_commit() {
+        let mut forest = Forest {
+            commit_map: HashMap::new(),
+            merge_storms: Vec::new(),
+        }
