@@ -1,214 +1,211 @@
-use crate::{Forest, CommitNode, MergeNode};
-use std::collections::{HashMap, HashSet};
+use crate::{Forest, CommitNode, MergeNode, LayoutResult};
+use std::collections::HashMap;
 
-/// Represents a detected merge storm — a period with many simultaneous merges.
+/// Represents a detected merge storm — a period of many simultaneous merges.
 #[derive(Debug, Clone)]
 pub struct MergeStorm {
-    /// The central commit ID where the storm occurs
-    pub epicenter: String,
-    /// Number of branches involved in the storm
+    /// The time window (commit timestamp range) for this storm
+    pub time_range: (i64, i64),
+    /// List of merge commits that are part of this storm
+    pub merges: Vec<String>,
+    /// Number of distinct branches involved
     pub branch_count: usize,
-    /// Total commits in the storm window
-    pub commit_count: usize,
-    /// The time window (in seconds) during which the storm occurred
-    pub time_window_secs: f64,
-    /// Intensity score (0.0 to 1.0) based on branch density
+    /// Intensity score (0.0 to 1.0) based on merge density and branch count
     pub intensity: f64,
-    /// List of branch names involved
-    pub branches: Vec<String>,
-    /// Commit IDs of all commits in the storm
-    pub commit_ids: Vec<String>,
 }
 
-/// Detect merge storms in the forest.
-/// A merge storm is defined as a commit that has more than `threshold` parents
-/// or a cluster of merges within a short time window.
-pub fn detect_merge_storms(
-    forest: &Forest,
-    threshold: usize,
-    time_window: f64,
-) -> Vec<MergeStorm> {
-    let mut storms = Vec::new();
-    let mut visited = HashSet::new();
-
-    // Build a map from commit ID to its timestamp
-    let timestamps: HashMap<&String, f64> = forest
-        .commit_map
+/// Detect merge storms in a forest layout.
+/// A merge storm is defined as a time window where the number of merge commits
+/// exceeds a dynamic threshold based on average merge frequency.
+pub fn detect_merge_storms(forest: &Forest, layout: &LayoutResult) -> Vec<MergeStorm> {
+    let merge_commits: Vec<&String> = forest
+        .merge_nodes
         .iter()
-        .map(|(id, node)| (id, node.timestamp))
+        .map(|n| &n.commit_id)
         .collect();
 
-    // Find merge points (commits with >1 parent)
-    let merges: Vec<&CommitNode> = forest
-        .commit_map
-        .values()
-        .filter(|node| node.parents.len() > 1)
+    if merge_commits.is_empty() {
+        return Vec::new();
+    }
+
+    // Collect timestamps for merge commits
+    let mut merge_times: Vec<(i64, &String)> = merge_commits
+        .iter()
+        .filter_map(|id| {
+            forest.commit_map.get(*id).map(|c| (c.timestamp, *id))
+        })
         .collect();
+    merge_times.sort_by_key(|(t, _)| *t);
 
-    // Cluster merges by time proximity
-    let mut merge_clusters: Vec<Vec<&CommitNode>> = Vec::new();
+    // Use a sliding window to find high-density periods
+    let window_size: i64 = 3600; // 1 hour in seconds
+    let min_storm_merges: usize = 3;
+    let mut storms: Vec<MergeStorm> = Vec::new();
 
-    for merge in &merges {
-        if visited.contains(&merge.id) {
-            continue;
+    let mut i = 0;
+    while i < merge_times.len() {
+        let window_start = merge_times[i].0;
+        let window_end = window_start + window_size;
+        let mut window_merges: Vec<&String> = Vec::new();
+        for j in i..merge_times.len() {
+            if merge_times[j].0 <= window_end {
+                window_merges.push(merge_times[j].1);
+            } else {
+                break;
+            }
         }
 
-        let mut cluster = vec![*merge];
-        visited.insert(merge.id.clone());
-
-        // Find nearby merges within the time window
-        for other in &merges {
-            if visited.contains(&other.id) {
-                continue;
-            }
-            if let (Some(t1), Some(t2)) = (timestamps.get(&merge.id), timestamps.get(&other.id)) {
-                if (t1 - t2).abs() <= time_window {
-                    cluster.push(*other);
-                    visited.insert(other.id.clone());
+        if window_merges.len() >= min_storm_merges {
+            // Compute branch count: unique parent branches for these merges
+            let mut parent_branches: Vec<&String> = Vec::new();
+            for merge_id in &window_merges {
+                if let Some(merge_node) = forest
+                    .merge_nodes
+                    .iter()
+                    .find(|n| &&n.commit_id == merge_id)
+                {
+                    for parent in &merge_node.parents {
+                        if !parent_branches.contains(parent) {
+                            parent_branches.push(parent);
+                        }
+                    }
                 }
             }
-        }
 
-        if cluster.len() >= threshold {
-            merge_clusters.push(cluster);
+            let branch_count = parent_branches.len();
+            let intensity = (window_merges.len() as f64 / 10.0).min(1.0)
+                * (branch_count as f64 / 10.0).min(1.0);
+
+            storms.push(MergeStorm {
+                time_range: (window_start, window_end),
+                merges: window_merges.iter().map(|s| (*s).clone()).collect(),
+                branch_count,
+                intensity,
+            });
+
+            // Skip ahead to avoid overlapping storms
+            i += window_merges.len();
+        } else {
+            i += 1;
         }
     }
 
-    // Convert clusters to MergeStorm objects
-    for cluster in merge_clusters {
-        let mut branch_set = HashSet::new();
-        let mut all_ids = Vec::new();
-        let mut total_parents = 0;
-
-        for node in &cluster {
-            all_ids.push(node.id.clone());
-            // Collect branch names from parents
-            for parent_id in &node.parents {
-                if let Some(parent) = forest.commit_map.get(parent_id) {
-                    branch_set.insert(parent.branch.clone());
-                }
-            }
-            total_parents += node.parents.len();
-        }
-
-        let branches: Vec<String> = branch_set.into_iter().collect();
-        let branch_count = branches.len();
-        let commit_count = all_ids.len();
-
-        // Intensity: ratio of branches to commits, normalized
-        let intensity = if commit_count > 0 {
-            (branch_count as f64 / commit_count as f64).min(1.0)
-        } else {
-            0.0
-        };
-
-        // Calculate time window
-        let timestamps_cluster: Vec<f64> = cluster
-            .iter()
-            .filter_map(|node| timestamps.get(&node.id))
-            .copied()
-            .collect();
-        let time_window_secs = if timestamps_cluster.len() >= 2 {
-            let min_t = timestamps_cluster.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max_t = timestamps_cluster.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            (max_t - min_t).max(0.0)
-        } else {
-            0.0
-        };
-
-        // Use the first merge as epicenter
-        let epicenter = cluster[0].id.clone();
-
-        storms.push(MergeStorm {
-            epicenter,
-            branch_count,
-            commit_count,
-            time_window_secs,
-            intensity,
-            branches,
-            commit_ids: all_ids,
-        });
-    }
+    // Merge overlapping storms
+    merge_overlapping_storms(&mut storms);
 
     storms
 }
 
-/// Generate a tangled root system visualization for a merge storm.
-/// Returns a vector of (x, y) coordinates representing root curves.
-pub fn generate_tangled_roots(
-    storm: &MergeStorm,
-    center_x: f64,
-    center_y: f64,
-    spread: f64,
-) -> Vec<(f64, f64)> {
-    let mut roots = Vec::new();
-    let num_roots = storm.branch_count.max(2);
-    let angle_step = std::f64::consts::PI * 2.0 / num_roots as f64;
+fn merge_overlapping_storms(storms: &mut Vec<MergeStorm>) {
+    if storms.is_empty() {
+        return;
+    }
+    storms.sort_by_key(|s| s.time_range.0);
 
-    for i in 0..num_roots {
-        let base_angle = angle_step * i as f64 + storm.intensity * 0.5;
-        let length = spread * (0.5 + storm.intensity * 0.5);
-        let segments = 10;
+    let mut merged: Vec<MergeStorm> = Vec::new();
+    let mut current = storms[0].clone();
 
-        for j in 0..=segments {
-            let t = j as f64 / segments as f64;
-            let angle = base_angle + t * storm.intensity * 1.5;
-            let radius = t * length * (1.0 + 0.3 * (t * 3.0).sin());
-            let x = center_x + radius * angle.cos();
-            let y = center_y + radius * angle.sin();
-            roots.push((x, y));
+    for storm in storms.iter().skip(1) {
+        if storm.time_range.0 <= current.time_range.1 {
+            // Overlap: merge
+            current.time_range.1 = current.time_range.1.max(storm.time_range.1);
+            for merge_id in &storm.merges {
+                if !current.merges.contains(merge_id) {
+                    current.merges.push(merge_id.clone());
+                }
+            }
+            current.branch_count = current.branch_count.max(storm.branch_count);
+            current.intensity = current.intensity.max(storm.intensity);
+        } else {
+            merged.push(current);
+            current = storm.clone();
         }
     }
+    merged.push(current);
 
-    roots
+    *storms = merged;
 }
 
-/// Highlight merge storms in the forest by adding visual markers.
-/// Returns a map of commit ID -> intensity for colored rendering.
-pub fn highlight_merge_storms(
-    forest: &Forest,
-    threshold: usize,
-    time_window: f64,
-) -> HashMap<String, f64> {
-    let storms = detect_merge_storms(forest, threshold, time_window);
-    let mut highlights = HashMap::new();
+/// Assign visual styling for merge storms in the render.
+/// Returns a tuple (color_r, color_g, color_b) based on intensity.
+pub fn storm_color(intensity: f64) -> (u8, u8, u8) {
+    // From dark purple (low intensity) to bright red (high intensity)
+    let r = (128.0 + intensity * 127.0) as u8;
+    let g = (0.0 + (1.0 - intensity) * 80.0) as u8;
+    let b = (128.0 - intensity * 128.0) as u8;
+    (r, g, b)
+}
 
-    for storm in &storms {
-        for id in &storm.commit_ids {
-            highlights.insert(id.clone(), storm.intensity);
-        }
+/// Return a label for the storm severity based on intensity.
+pub fn storm_label(intensity: f64) -> &'static str {
+    if intensity >= 0.8 {
+        "severe merge storm"
+    } else if intensity >= 0.5 {
+        "moderate merge storm"
+    } else if intensity >= 0.3 {
+        "minor merge storm"
+    } else {
+        "gentle merge breeze"
     }
-
-    highlights
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Forest, CommitNode};
-    use std::collections::HashMap;
+    use crate::{Forest, CommitNode, MergeNode};
 
-    fn create_test_forest() -> Forest {
-        let mut commit_map = HashMap::new();
-        // Create a merge storm: commit 'c' has 3 parents
-        commit_map.insert(
-            "a".to_string(),
-            CommitNode {
-                id: "a".to_string(),
-                author: "alice".to_string(),
-                timestamp: 1000.0,
-                parents: vec![],
-                branch: "main".to_string(),
-                message: "initial".to_string(),
-            },
-        );
-        commit_map.insert(
-            "b".to_string(),
-            CommitNode {
-                id: "b".to_string(),
-                author: "bob".to_string(),
-                timestamp: 1001.0,
-                parents: vec!["a".to_string()],
-                branch: "feature".to_string(),
-                message: "work".to_string(),
-            }
+    fn make_forest_with_merges(merge_timestamps: &[i64]) -> Forest {
+        let mut forest = Forest {
+            trees: Vec::new(),
+            commit_map: HashMap::new(),
+            merge_nodes: Vec::new(),
+            branch_names: Vec::new(),
+        };
+
+        for (i, ts) in merge_timestamps.iter().enumerate() {
+            let commit_id = format!("merge{}", i);
+            forest.commit_map.insert(
+                commit_id.clone(),
+                CommitNode {
+                    id: commit_id.clone(),
+                    message: format!("Merge {}", i),
+                    author: "test".to_string(),
+                    timestamp: *ts,
+                    parents: vec!["parent1".to_string(), "parent2".to_string()],
+                    children: Vec::new(),
+                },
+            );
+            forest.merge_nodes.push(MergeNode {
+                commit_id: commit_id.clone(),
+                parents: vec!["parent1".to_string(), "parent2".to_string()],
+            });
+        }
+
+        forest
+    }
+
+    #[test]
+    fn test_no_merges() {
+        let forest = Forest {
+            trees: Vec::new(),
+            commit_map: HashMap::new(),
+            merge_nodes: Vec::new(),
+            branch_names: Vec::new(),
+        };
+        let layout = LayoutResult {
+            grid: Vec::new(),
+            tree_lines: Vec::new(),
+            merge_storms: Vec::new(),
+        };
+        let storms = detect_merge_storms(&forest, &layout);
+        assert!(storms.is_empty());
+    }
+
+    #[test]
+    fn test_single_merge_no_storm() {
+        let forest = make_forest_with_merges(&[1000]);
+        let layout = LayoutResult {
+            grid: Vec::new(),
+            tree_lines: Vec::new(),
+            merge_storms: Vec::new(),
+        }
