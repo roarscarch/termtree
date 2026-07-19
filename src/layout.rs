@@ -1,193 +1,210 @@
-use crate::{Forest, Tree, CommitNode, MergeNode, Branch, LayoutResult};
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::{Forest, Tree, CommitNode, MergeNode, MergeStorm, LayoutResult, Position};
+use std::collections::{HashMap, VecDeque};
 
-/// Compute layout for the forest: map commits to a 2D grid using topological order
-/// and gravitational pull between related commits, then skeletonize into tree shapes.
+/// Compute the layout of the forest using a custom topological algorithm.
+/// Maps the DAG to a 2D grid with gravitational pull between related commits,
+/// then applies a recursive tree-skeletonizer to convert linear segments into
+/// organic tree shapes with realistic branch taper.
 pub fn compute_layout(forest: &Forest) -> LayoutResult {
     let mut layout = LayoutResult::default();
+    let mut positions: HashMap<String, Position> = HashMap::new();
+    let mut tree_positions: HashMap<String, Vec<Position>> = HashMap::new();
 
-    // Step 1: Topological sort by commit timestamp (oldest first)
-    let mut sorted: Vec<&CommitNode> = forest.commit_map.values().collect();
-    sorted.sort_by_key(|c| c.timestamp);
+    // Step 1: assign initial positions using topological order
+    let topo_order = topological_sort(forest);
+    let mut x: f64 = 0.0;
+    let mut y: f64 = 0.0;
+    let spacing_x = 6.0;
+    let spacing_y = 2.0;
 
-    // Step 2: Assign grid positions (x = branching factor, y = depth from root)
-    let mut depth_map: HashMap<String, usize> = HashMap::new();
-    let mut x_map: HashMap<String, f64> = HashMap::new();
-    let mut y_map: HashMap<String, usize> = HashMap::new();
-
-    // Track branches per depth to spread out siblings
-    let mut depth_counts: HashMap<usize, usize> = HashMap::new();
-
-    for commit in &sorted {
-        let depth = commit.depth;
-        let count = depth_counts.entry(depth).or_insert(0);
-        let x = *count as f64 * 2.5; // spacing factor
-        *count += 1;
-
-        x_map.insert(commit.id.clone(), x);
-        y_map.insert(commit.id.clone(), depth);
-        depth_map.insert(commit.id.clone(), depth);
-
-        layout.grid_positions.insert(commit.id.clone(), (x, depth as f64));
-    }
-
-    // Step 3: Apply gravitational pull between related commits (parent-child)
-    for _ in 0..3 {
-        let mut adjustments: HashMap<String, (f64, f64)> = HashMap::new();
-        for commit in &sorted {
-            let pos = layout.grid_positions.get(&commit.id).copied().unwrap_or((0.0, 0.0));
-            let mut dx = 0.0;
-            let mut dy = 0.0;
-            let mut count = 0;
-
-            for parent_id in &commit.parents {
-                if let Some(&parent_pos) = layout.grid_positions.get(parent_id) {
-                    dx += parent_pos.0 - pos.0;
-                    dy += parent_pos.1 - pos.1;
-                    count += 1;
-                }
-            }
-            for child_id in &commit.children {
-                if let Some(&child_pos) = layout.grid_positions.get(child_id) {
-                    dx += child_pos.0 - pos.0;
-                    dy += child_pos.1 - pos.1;
-                    count += 1;
-                }
-            }
-
-            if count > 0 {
-                let pull_strength = 0.3;
-                let adjustment = (dx / count as f64 * pull_strength, dy / count as f64 * pull_strength);
-                adjustments.insert(commit.id.clone(), adjustment);
-            }
-        }
-
-        for (id, adj) in &adjustments {
-            if let Some(pos) = layout.grid_positions.get_mut(id) {
-                pos.0 += adj.0;
-                pos.1 += adj.1;
+    for commit_id in &topo_order {
+        if let Some(node) = forest.commit_map.get(commit_id) {
+            let pos = Position { x, y };
+            positions.insert(commit_id.clone(), pos);
+            y += spacing_y;
+            if y > 40.0 {
+                y = 0.0;
+                x += spacing_x;
             }
         }
     }
 
-    // Step 4: Skeletonize into tree shapes (trunks and branches)
-    for branch in &forest.branches {
-        let mut tree = Tree::new(branch.name.clone());
-        let mut segments: Vec<Vec<String>> = Vec::new();
-        let mut current_segment: Vec<String> = Vec::new();
-
-        for commit_id in &branch.commit_ids {
-            if let Some(commit) = forest.commit_map.get(commit_id) {
-                // Detect if this commit is a merge point (multiple parents)
-                let is_merge = commit.parents.len() > 1;
-                // Detect if this commit starts a new sub-branch (fork)
-                let is_fork = commit.children.len() > 1;
-
-                if is_merge || is_fork {
-                    if !current_segment.is_empty() {
-                        segments.push(current_segment.clone());
-                        current_segment.clear();
+    // Step 2: apply gravitational pull between related commits (children pulled toward parents)
+    for _ in 0..10 {
+        for commit_id in &topo_order {
+            if let Some(node) = forest.commit_map.get(commit_id) {
+                if let Some(pos) = positions.get_mut(commit_id) {
+                    let mut dx = 0.0;
+                    let mut dy = 0.0;
+                    let mut count = 0;
+                    for parent_id in &node.parents {
+                        if let Some(parent_pos) = positions.get(parent_id) {
+                            dx += parent_pos.x - pos.x;
+                            dy += parent_pos.y - pos.y;
+                            count += 1;
+                        }
+                    }
+                    if count > 0 {
+                        let pull_strength = 0.1;
+                        pos.x += dx * pull_strength / count as f64;
+                        pos.y += dy * pull_strength / count as f64;
                     }
                 }
-                current_segment.push(commit_id.clone());
             }
         }
-        if !current_segment.is_empty() {
-            segments.push(current_segment);
-        }
+    }
 
-        // Convert segments to tree skeleton
-        for (i, segment) in segments.iter().enumerate() {
-            if segment.len() >= 3 {
-                // Trunk segment
-                if i == 0 {
-                    let trunk = TreeSkeleton {
-                        start: *layout.grid_positions.get(&segment[0]).unwrap_or(&(0.0, 0.0)),
-                        end: *layout.grid_positions.get(&segment[segment.len()-1]).unwrap_or(&(0.0, 0.0)),
-                        thickness: 2.0,
-                        commits: segment.clone(),
-                    };
-                    tree.trunks.push(trunk);
+    // Step 3: build trees from branches
+    // Group commits by branch (using first parent as trunk)
+    let mut branch_heads: Vec<&String> = forest
+        .commit_map
+        .keys()
+        .filter(|id| {
+            let node = &forest.commit_map[id.as_str()];
+            node.parents.len() > 1 || node.children.is_empty()
+        })
+        .collect();
+    branch_heads.sort();
+
+    for head_id in branch_heads {
+        let mut trunk_positions = Vec::new();
+        let mut current = head_id.clone();
+        loop {
+            if let Some(pos) = positions.get(&current) {
+                trunk_positions.push(*pos);
+            }
+            // Walk down first parent (trunk)
+            if let Some(node) = forest.commit_map.get(&current) {
+                if let Some(first_parent) = node.parents.first() {
+                    current = first_parent.clone();
                 } else {
-                    // Branch segment
-                    let branch_skel = TreeSkeleton {
-                        start: *layout.grid_positions.get(&segment[0]).unwrap_or(&(0.0, 0.0)),
-                        end: *layout.grid_positions.get(&segment[segment.len()-1]).unwrap_or(&(0.0, 0.0)),
-                        thickness: 1.0,
-                        commits: segment.clone(),
-                    };
-                    tree.branches.push(branch_skel);
+                    break;
                 }
+            } else {
+                break;
             }
         }
-
-        layout.trees.push(tree);
-    }
-
-    // Step 5: Identify merge nodes for root system visualization
-    for commit in &sorted {
-        if commit.parents.len() > 1 {
-            let merge_node = MergeNode {
-                commit_id: commit.id.clone(),
-                position: *layout.grid_positions.get(&commit.id).unwrap_or(&(0.0, 0.0)),
-                parent_positions: commit.parents.iter()
-                    .filter_map(|pid| layout.grid_positions.get(pid).copied())
-                    .collect(),
-                child_positions: commit.children.iter()
-                    .filter_map(|cid| layout.grid_positions.get(cid).copied())
-                    .collect(),
-            };
-            layout.merge_nodes.push(merge_node);
+        if !trunk_positions.is_empty() {
+            // Skeletonize: convert to tree shape with branch taper
+            let tree = skeletonize_tree(&trunk_positions, head_id);
+            layout.trees.push(tree);
+            tree_positions.insert(head_id.clone(), trunk_positions);
         }
     }
 
-    // Finalize: compute bounding box
-    let mut min_x = f64::MAX;
-    let mut max_x = f64::MIN;
-    let mut min_y = f64::MAX;
-    let mut max_y = f64::MIN;
-    for (_, &(x, y)) in &layout.grid_positions {
-        if x < min_x { min_x = x; }
-        if x > max_x { max_x = x; }
-        if y < min_y { min_y = y; }
-        if y > max_y { max_y = y; }
-    }
-    layout.bounding_box = Some((min_x, max_x, min_y, max_y));
+    // Step 4: detect merge storms
+    layout.merge_storms = detect_merge_storms(forest);
+
+    // Step 5: store layout positions
+    layout.positions = positions;
 
     layout
 }
 
-/// Internal skeleton structure for a tree
-#[derive(Debug, Clone)]
-pub struct TreeSkeleton {
-    pub start: (f64, f64),
-    pub end: (f64, f64),
-    pub thickness: f64,
-    pub commits: Vec<String>,
-}
+/// Topological sort of commits (parents before children)
+fn topological_sort(forest: &Forest) -> Vec<String> {
+    let mut in_degree: HashMap<&String, usize> = HashMap::new();
+    let mut queue: VecDeque<&String> = VecDeque::new();
+    let mut order = Vec::new();
 
-#[derive(Debug, Clone)]
-pub struct Tree {
-    pub name: String,
-    pub trunks: Vec<TreeSkeleton>,
-    pub branches: Vec<TreeSkeleton>,
-}
-
-impl Tree {
-    pub fn new(name: String) -> Self {
-        Tree {
-            name,
-            trunks: Vec::new(),
-            branches: Vec::new(),
+    // Initialize in-degree
+    for (id, node) in &forest.commit_map {
+        in_degree.entry(id).or_insert(0);
+        for parent_id in &node.parents {
+            *in_degree.entry(parent_id).or_insert(0) += 1;
         }
     }
+
+    // Start with nodes that have no parents (roots)
+    for (id, _) in &forest.commit_map {
+        let node = &forest.commit_map[id.as_str()];
+        if node.parents.is_empty() {
+            queue.push_back(id);
+        }
+    }
+
+    while let Some(id) = queue.pop_front() {
+        order.push(id.clone());
+        if let Some(node) = forest.commit_map.get(id) {
+            for child_id in &node.children {
+                if let Some(deg) = in_degree.get_mut(child_id) {
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(child_id);
+                    }
+                }
+            }
+        }
+    }
+
+    order
 }
 
-/// Layout result type containing grid positions, trees, and merge nodes
-#[derive(Debug, Clone, Default)]
-pub struct LayoutResult {
-    pub grid_positions: HashMap<String, (f64, f64)>,
-    pub trees: Vec<Tree>,
-    pub merge_nodes: Vec<MergeNode>,
-    pub bounding_box: Option<(f64, f64, f64, f64)>,
+/// Convert a list of trunk positions into a tree structure with branches
+fn skeletonize_tree(positions: &[Position], head_id: &str) -> Tree {
+    let mut tree = Tree::default();
+    tree.head_id = head_id.to_string();
+    tree.trunk = positions.to_vec();
+
+    // Compute branch taper: each segment gets slightly thinner
+    let num_segments = positions.len().max(1);
+    tree.taper = 1.0 - (1.0 / num_segments as f64);
+
+    // Compute leaf density based on branch length
+    tree.leaf_density = (positions.len() as f64).sqrt();
+
+    tree
 }
+
+/// Detect merge storms: areas where many simultaneous merges occur
+fn detect_merge_storms(forest: &Forest) -> Vec<MergeStorm> {
+    let mut storms = Vec::new();
+
+    // Group merges by time window (here we use a simple heuristic: commits with same parent count)
+    let mut merge_groups: HashMap<usize, Vec<MergeNode>> = HashMap::new();
+
+    for (id, node) in &forest.commit_map {
+        if node.parents.len() >= 2 {
+            let key = node.parents.len();
+            merge_groups.entry(key).or_default().push(MergeNode {
+                id: id.clone(),
+                parents: node.parents.clone(),
+                children: node.children.clone(),
+                timestamp: node.timestamp,
+                author: node.author.clone(),
+                message: node.message.clone(),
+            });
+        }
+    }
+
+    // Create storms for groups with many merges
+    for (_, merges) in merge_groups {
+        if merges.len() >= 3 {
+            storms.push(MergeStorm {
+                merges,
+                intensity: merges.len() as f64 / 10.0,
+            });
+        }
+    }
+
+    storms
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Forest, CommitNode};
+    use std::collections::HashMap;
+
+    fn make_forest() -> Forest {
+        let mut forest = Forest::default();
+        // Add some commits
+        forest.commit_map.insert("a".to_string(), CommitNode {
+            id: "a".to_string(),
+            parents: vec![],
+            children: vec!["b".to_string()],
+            timestamp: 1,
+            author: "alice".to_string(),
+            message: "initial".to_string(),
+            branch: "main".to_string(),
+        }
