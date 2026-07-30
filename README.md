@@ -16,3 +16,4 @@ cargo build --release
 - Click a branch: show commit details
 - `q`: quit
 - Export to SVG with `--export`
+
